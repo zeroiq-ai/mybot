@@ -404,12 +404,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # In groups, only act when the bot is addressed.
     if _is_group(update) and not _addressed_to_bot(update, context):
         return
-    photo = msg.photo[-1]              # largest available size
+
+    # Accept both compressed photos and images sent as a file/document.
+    if msg.photo:
+        file_id = msg.photo[-1].file_id          # largest available size
+        mime = "image/jpeg"
+    elif msg.document and (msg.document.mime_type or "").startswith("image/"):
+        file_id = msg.document.file_id
+        mime = msg.document.mime_type
+    else:
+        return
+
     caption = _strip_bot_mention((msg.caption or "").strip(), context)
 
     try:
-        raw = await download_tg_file(context, photo.file_id)
-        src_url = _data_url(raw, "image/jpeg")
+        raw = await download_tg_file(context, file_id)
+        src_url = _data_url(raw, mime)
 
         if caption:
             # Image-to-image edit
@@ -525,7 +535,7 @@ def main() -> None:
     app.add_handler(CommandHandler("info",    cmd_info))
     app.add_handler(CommandHandler("imagine", cmd_imagine))
     app.add_handler(CallbackQueryHandler(callback_set_model, pattern=r"^setmodel:"))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(on_error)
