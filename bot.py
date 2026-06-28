@@ -3,7 +3,9 @@ import io
 import time
 import base64
 import random
+import sqlite3
 import logging
+import threading
 import httpx
 from datetime import time as dtime
 from zoneinfo import ZoneInfo
@@ -136,6 +138,86 @@ last_active:   dict[int, float]      = {}   # chat_id → epoch seconds of last 
 MAX_HISTORY = 40
 MAX_TOKENS  = 1024
 
+# ── Persistence (SQLite) ──────────────────────────────────────────────────────
+# NOTE: on Railway the filesystem is ephemeral. Attach a Volume and point
+# DB_PATH at it (e.g. /data/bot.db) so the database survives redeploys.
+DB_PATH = os.environ.get("DB_PATH", "bot.db")
+_db = sqlite3.connect(DB_PATH, check_same_thread=False)
+_db_lock = threading.Lock()
+
+
+def db_init() -> None:
+    """Create tables and load persisted state into the in-memory caches."""
+    with _db_lock:
+        _db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS chat_state (
+                chat_id     INTEGER PRIMARY KEY,
+                model       TEXT,
+                cursed      INTEGER,
+                last_active REAL
+            );
+            CREATE TABLE IF NOT EXISTS messages (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                role    TEXT,
+                content TEXT,
+                ts      REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id);
+            """
+        )
+        _db.commit()
+        for chat_id, model, cursed, la in _db.execute(
+            "SELECT chat_id, model, cursed, last_active FROM chat_state"
+        ):
+            if model:
+                user_model[chat_id] = model
+            if cursed is not None:
+                cursed_mode[chat_id] = bool(cursed)
+            if la is not None:
+                last_active[chat_id] = la
+        for chat_id, role, content in _db.execute(
+            "SELECT chat_id, role, content FROM messages ORDER BY id"
+        ):
+            conversations[chat_id].append({"role": role, "content": content})
+    known_chats = set(user_model) | set(cursed_mode) | set(last_active)
+    stored_msgs = sum(len(v) for v in conversations.values())
+    logger.info("DB loaded: %d chats, %d stored messages", len(known_chats), stored_msgs)
+
+
+def save_chat_state(chat_id: int) -> None:
+    with _db_lock:
+        _db.execute(
+            "INSERT INTO chat_state(chat_id, model, cursed, last_active) VALUES(?,?,?,?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET "
+            "model=excluded.model, cursed=excluded.cursed, last_active=excluded.last_active",
+            (chat_id, user_model.get(chat_id),
+             1 if get_cursed(chat_id) else 0, last_active.get(chat_id)),
+        )
+        _db.commit()
+
+
+def save_message(chat_id: int, role: str, content: str) -> None:
+    with _db_lock:
+        _db.execute(
+            "INSERT INTO messages(chat_id, role, content, ts) VALUES(?,?,?,?)",
+            (chat_id, role, content, time.time()),
+        )
+        # Keep only the most recent MAX_HISTORY rows per chat.
+        _db.execute(
+            "DELETE FROM messages WHERE chat_id=? AND id NOT IN "
+            "(SELECT id FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT ?)",
+            (chat_id, chat_id, MAX_HISTORY),
+        )
+        _db.commit()
+
+
+def clear_messages(chat_id: int) -> None:
+    with _db_lock:
+        _db.execute("DELETE FROM messages WHERE chat_id=?", (chat_id,))
+        _db.commit()
+
 
 def get_model(chat_id: int) -> str:
     return user_model.get(chat_id, DEFAULT_CHAT_MODEL)
@@ -184,6 +266,7 @@ def trim_history(chat_id: int) -> None:
 async def ask_model(chat_id: int, user_text: str) -> str:
     conversations[chat_id].append({"role": "user", "content": user_text})
     trim_history(chat_id)
+    save_message(chat_id, "user", user_text)
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversations[chat_id]
 
@@ -198,6 +281,7 @@ async def ask_model(chat_id: int, user_text: str) -> str:
     if not reply:
         reply = "⚠️ Модель вернула пустой ответ. Попробуй переформулировать."
     conversations[chat_id].append({"role": "assistant", "content": reply})
+    save_message(chat_id, "assistant", reply)
     return reply
 
 
@@ -237,6 +321,7 @@ async def gen_text(prompt: str, max_tokens: int = 300, temperature: float = 1.1)
 def _touch(chat_id: int) -> None:
     """Mark a chat as active right now (used to pick recipients for daily greeting)."""
     last_active[chat_id] = time.time()
+    save_chat_state(chat_id)
 
 
 # ── Image generation ──────────────────────────────────────────────────────────
@@ -360,6 +445,8 @@ async def callback_set_model(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     user_model[chat_id] = model_id
     conversations[chat_id].clear()   # сбрасываем историю при смене модели
+    save_chat_state(chat_id)
+    clear_messages(chat_id)
 
     # найдём label
     label = model_id
@@ -392,6 +479,7 @@ async def callback_cursed(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
     chat_id = query.message.chat_id
     cursed_mode[chat_id] = (query.data.split(":", 1)[1] == "on")
+    save_chat_state(chat_id)
     state = "включён 😈" if cursed_mode[chat_id] else "выключен"
     await query.edit_message_text(
         f"Всратый режим {state}.",
@@ -400,7 +488,9 @@ async def callback_cursed(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conversations[update.effective_chat.id].clear()
+    chat_id = update.effective_chat.id
+    conversations[chat_id].clear()
+    clear_messages(chat_id)
     await update.message.reply_text("🗑️ История очищена. Начинаем заново!")
 
 
@@ -654,6 +744,7 @@ async def _post_init(app) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main() -> None:
     token = _require_env("TELEGRAM_BOT_TOKEN")
+    db_init()
     app = ApplicationBuilder().token(token).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("start",   cmd_start))
