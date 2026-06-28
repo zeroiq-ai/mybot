@@ -1,8 +1,12 @@
 import os
 import io
+import time
 import base64
+import random
 import logging
 import httpx
+from datetime import time as dtime
+from zoneinfo import ZoneInfo
 from collections import defaultdict
 from openai import AsyncOpenAI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -94,10 +98,40 @@ CURSED_PROMPT = (
     "изображений — что конкретно изменить/добавить. Без вступлений и пояснений."
 )
 
+# Random captions for cursed-mode results (instead of always the same one).
+CURSED_CAPTIONS = [
+    "😈 держи",
+    "ну как тебе такое",
+    "я старался 💀",
+    "это шедевр, не спорь",
+    "осторожно, кринж",
+    "произведение искусства 🗿",
+    "галерея заплачет",
+    "лучше оригинала, очевидно",
+    "не показывай это детям",
+    "вот это я понимаю арт ✨",
+    "получилось всрато, как ты любишь",
+    "не благодари",
+]
+
+# Daily morning greeting, generated fresh each time for variety.
+GREETING_PROMPT = (
+    "Напиши короткое (2–4 предложения) утреннее пожелание хорошего дня для "
+    "группового чата. Стиль — всратый, абсурдный, с щепоткой чёрного юмора, "
+    "дружелюбно-токсичный, но без оскорблений конкретных людей. Обращайся ко всем "
+    "как 'кожаные мешки'. Обязательно вставь пожелание, чтобы те, кто сегодня идёт "
+    "на работу, лишний раз улыбнулись. Каждый раз придумывай заново и по-новому. "
+    "Верни только текст пожелания, без кавычек и пояснений."
+)
+
+# Timezone for the daily greeting.
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+
 # ── Per-user state: model + conversation history ──────────────────────────────
 conversations: dict[int, list[dict]] = defaultdict(list)
 user_model:    dict[int, str]        = {}   # chat_id → model id
 cursed_mode:   dict[int, bool]       = {}   # chat_id → auto "cursed" remix (default ON)
+last_active:   dict[int, float]      = {}   # chat_id → epoch seconds of last activity
 
 MAX_HISTORY = 40
 MAX_TOKENS  = 1024
@@ -186,6 +220,23 @@ async def ask_multimodal(parts: list[dict], max_tokens: int = 1024) -> str:
         extra_headers={"X-Title": "Telegram Claude Bot"},
     )
     return response.choices[0].message.content or ""
+
+
+async def gen_text(prompt: str, max_tokens: int = 300, temperature: float = 1.1) -> str:
+    """One-off text generation (no history). Higher temperature for variety."""
+    response = await client.chat.completions.create(
+        model=AUX_MODEL,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        messages=[{"role": "user", "content": prompt}],
+        extra_headers={"X-Title": "Telegram Claude Bot"},
+    )
+    return response.choices[0].message.content or ""
+
+
+def _touch(chat_id: int) -> None:
+    """Mark a chat as active right now (used to pick recipients for daily greeting)."""
+    last_active[chat_id] = time.time()
 
 
 # ── Image generation ──────────────────────────────────────────────────────────
@@ -424,6 +475,7 @@ async def send_long(message, text: str) -> None:
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
+    _touch(chat_id)
     text = update.message.text
     # In groups, only respond when the bot is addressed (mention or reply).
     if _is_group(update):
@@ -451,6 +503,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     If a photo arrives with no request → auto 'cursed' remix: analyse it, then
     transform it into an absurd/funny version with a touch of dark humour."""
     chat_id = update.effective_chat.id
+    _touch(chat_id)
     msg = update.message
 
     # Accept both compressed photos and images sent as a file/document.
@@ -494,7 +547,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 {"type": "image_url", "image_url": {"url": src_url}},
             ])).strip() or "Make this image absurd, cursed and darkly funny, exaggerate everything."
             out = await generate_image(instruction, references=[src_url])
-            await msg.reply_photo(photo=io.BytesIO(out), caption="😈 держи")
+            await msg.reply_photo(photo=io.BytesIO(out), caption=random.choice(CURSED_CAPTIONS))
             await status.delete()
     except httpx.HTTPStatusError as e:
         detail = _openrouter_error_text(e.response)
@@ -508,6 +561,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Transcribe a voice note / audio, then answer it like a normal message."""
     chat_id = update.effective_chat.id
+    _touch(chat_id)
     msg = update.message
     media = msg.voice or msg.audio
     if media is None:
@@ -557,13 +611,30 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/info — текущие модели и статистика\n"
         "/imagine <промпт> [--ratio 16:9] — сгенерировать картинку\n"
         "/cursed — включить/выключить всратый режим 😈\n"
-        "/help — эта справка"
+        "/help — эта справка\n\n"
+        "🌅 Каждое утро в 8:00 (МСК) желаю хорошего дня в активных чатах."
     )
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log any uncaught handler exception instead of failing silently."""
     logger.error("Unhandled exception", exc_info=context.error)
+
+
+async def morning_greeting(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Post a fresh 'cursed' good-morning to every chat active in the last 24h."""
+    cutoff = time.time() - 24 * 3600
+    recipients = [cid for cid, ts in last_active.items() if ts >= cutoff]
+    logger.info("Morning greeting → %d active chats", len(recipients))
+    for chat_id in recipients:
+        try:
+            text = (await gen_text(GREETING_PROMPT)).strip()
+            if not text:
+                text = ("Доброе утро, кожаные мешки 🦴 Хорошего вам дня, а кто сегодня "
+                        "тащится на работу — улыбнитесь лишний раз, вам идёт.")
+            await context.bot.send_message(chat_id, text)
+        except Exception:
+            logger.exception("Greeting failed for chat %s", chat_id)
 
 
 # ── Bot command menu (shown in Telegram UI) ───────────────────────────────────
@@ -598,6 +669,17 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(on_error)
+
+    # Daily 08:00 Moscow-time greeting to chats active in the last 24h.
+    if app.job_queue is not None:
+        app.job_queue.run_daily(
+            morning_greeting,
+            time=dtime(hour=8, minute=0, tzinfo=MOSCOW_TZ),
+            name="morning_greeting",
+        )
+        logger.info("Scheduled daily morning greeting at 08:00 Europe/Moscow")
+    else:
+        logger.warning("JobQueue unavailable — install python-telegram-bot[job-queue] to enable the daily greeting")
 
     logger.info("Bot started")
     app.run_polling(drop_pending_updates=True)
