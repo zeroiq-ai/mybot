@@ -51,7 +51,7 @@ OR_HEADERS = {
 AVAILABLE_MODELS = [
     {"id": "anthropic/claude-sonnet-4-6",           "label": "🟠 Claude Sonnet 4.6"},
     {"id": "z-ai/glm-5.2",                          "label": "🔵 GLM 5.2"},
-    {"id": "google/gemini-2.0-flash-001",            "label": "🟢 Gemini Flash 2.0"},
+    {"id": "google/gemini-2.5-flash",                "label": "🟢 Gemini 2.5 Flash"},
     {"id": "openai/gpt-4o",                          "label": "⚫ GPT-4o"},
     {"id": "deepseek/deepseek-v4-flash",             "label": "🔷 DeepSeek V4 Flash"},
     {"id": "deepseek/deepseek-r1-0528",             "label": "🧠 DeepSeek R1"},
@@ -72,7 +72,7 @@ DEFAULT_CHAT_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet
 
 # Multimodal model used for image understanding and voice transcription
 # (must accept image + audio input). Gemini Flash handles both cheaply.
-AUX_MODEL = os.environ.get("OPENROUTER_AUX_MODEL", "google/gemini-2.0-flash-001")
+AUX_MODEL = os.environ.get("OPENROUTER_AUX_MODEL", "google/gemini-2.5-flash")
 
 # Telegram hard limit for a single text message.
 TG_MAX_LEN = 4096
@@ -500,9 +500,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         detail = _openrouter_error_text(e.response)
         logger.error("Photo API error: %s — %s", e.response.status_code, detail)
         await msg.reply_text(f"⚠️ Ошибка (HTTP {e.response.status_code}): {detail}")
-    except Exception:
+    except Exception as e:
         logger.exception("Photo error")
-        await msg.reply_text("⚠️ Не получилось обработать фото. Попробуй ещё раз.")
+        await msg.reply_text(f"⚠️ Не получилось обработать фото: {e}")
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
