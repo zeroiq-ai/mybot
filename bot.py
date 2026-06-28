@@ -83,6 +83,17 @@ SYSTEM_PROMPT = (
     "Keep answers focused and practical."
 )
 
+# Used when an image is sent without an explicit request: the vision model looks
+# at the picture and returns a short edit instruction to make it absurd/funny.
+CURSED_PROMPT = (
+    "Посмотри на это изображение. Придумай, как превратить его в максимально "
+    "всратую, нелепую и абсурдно смешную версию с щепоткой чёрного юмора: "
+    "гротеск, кринж, утрированные детали, неожиданные абсурдные элементы. "
+    "Это безобидный шуточный юмор, без жести и оскорблений конкретных людей. "
+    "Верни ТОЛЬКО короткую инструкцию (1–2 предложения) для модели редактирования "
+    "изображений — что конкретно изменить/добавить. Без вступлений и пояснений."
+)
+
 # ── Per-user state: model + conversation history ──────────────────────────────
 conversations: dict[int, list[dict]] = defaultdict(list)
 user_model:    dict[int, str]        = {}   # chat_id → model id
@@ -257,7 +268,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"👋 Привет! Сейчас работаю на {get_model_label(chat_id)}.\n\n"
         "Просто напиши мне — я помню нашу беседу.\n"
         "🎙 Голосовое — распознаю и отвечу.\n"
-        "🖼 Фото без подписи — опишу; фото с подписью — отредактирую.\n\n"
+        "🖼 Фото без запроса — сделаю всратую смешную версию; с запросом — отредактирую.\n\n"
         "Команды:\n"
         "/model   – выбрать модель\n"
         "/reset   – очистить историю\n"
@@ -398,12 +409,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Photo with a caption → edit it. Photo without a caption → describe/answer."""
+    """If the bot is asked something → edit the image as requested.
+    If a photo arrives with no request → auto 'cursed' remix: analyse it, then
+    transform it into an absurd/funny version with a touch of dark humour."""
     chat_id = update.effective_chat.id
     msg = update.message
-    # In groups, only act when the bot is addressed.
-    if _is_group(update) and not _addressed_to_bot(update, context):
-        return
 
     # Accept both compressed photos and images sent as a file/document.
     if msg.photo:
@@ -415,32 +425,35 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         return
 
-    caption = _strip_bot_mention((msg.caption or "").strip(), context)
+    # Is there an explicit instruction for the bot?
+    caption = (msg.caption or "").strip()
+    if _is_group(update):
+        # In groups, an instruction only counts if the bot is addressed.
+        prompt = _strip_bot_mention(caption, context) if _addressed_to_bot(update, context) else ""
+    else:
+        prompt = caption
 
     try:
         raw = await download_tg_file(context, file_id)
         src_url = _data_url(raw, mime)
+        await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
 
-        if caption:
-            # Image-to-image edit
-            await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
-            status = await msg.reply_text(f"🎨 Редактирую по запросу: {caption}")
-            out = await generate_image(caption, references=[src_url])
-            cap = f"🎨 {caption}"[:1024]
-            await msg.reply_photo(photo=io.BytesIO(out), caption=cap)
+        if prompt:
+            # Explicit image-to-image edit
+            status = await msg.reply_text(f"🎨 Редактирую по запросу: {prompt}")
+            out = await generate_image(prompt, references=[src_url])
+            await msg.reply_photo(photo=io.BytesIO(out), caption=f"🎨 {prompt}"[:1024])
             await status.delete()
         else:
-            # Image understanding
-            await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-            answer = await ask_multimodal([
-                {"type": "text", "text": "Опиши это изображение кратко и по делу."},
+            # No request → make it cursed & funny (analyse, then transform)
+            status = await msg.reply_text("😈 Сейчас будет всрато...")
+            instruction = (await ask_multimodal([
+                {"type": "text", "text": CURSED_PROMPT},
                 {"type": "image_url", "image_url": {"url": src_url}},
-            ])
-            # Keep history portable across text-only models: store a text summary.
-            conversations[chat_id].append({"role": "user", "content": "[прислал изображение]"})
-            conversations[chat_id].append({"role": "assistant", "content": answer})
-            trim_history(chat_id)
-            await send_long(msg, answer or "⚠️ Не удалось разобрать изображение.")
+            ])).strip() or "Make this image absurd, cursed and darkly funny, exaggerate everything."
+            out = await generate_image(instruction, references=[src_url])
+            await msg.reply_photo(photo=io.BytesIO(out), caption="😈 держи")
+            await status.delete()
     except httpx.HTTPStatusError as e:
         detail = _openrouter_error_text(e.response)
         logger.error("Photo API error: %s — %s", e.response.status_code, detail)
@@ -494,8 +507,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Что я умею:\n\n"
         "💬 Просто напиши текст — отвечу и запомню беседу.\n"
         "🎙 Пришли голосовое — распознаю и отвечу.\n"
-        "🖼 Пришли фото без подписи — опишу его.\n"
-        "✏️ Пришли фото с подписью — отредактирую по ней.\n\n"
+        "🖼 Пришли фото без запроса — переделаю во всратую смешную версию 😈\n"
+        "✏️ Пришли фото с подписью/упоминанием — отредактирую как просишь.\n\n"
         "Команды:\n"
         "/model — выбрать модель\n"
         "/reset — очистить историю\n"
