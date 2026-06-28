@@ -97,6 +97,7 @@ CURSED_PROMPT = (
 # ── Per-user state: model + conversation history ──────────────────────────────
 conversations: dict[int, list[dict]] = defaultdict(list)
 user_model:    dict[int, str]        = {}   # chat_id → model id
+cursed_mode:   dict[int, bool]       = {}   # chat_id → auto "cursed" remix (default ON)
 
 MAX_HISTORY = 40
 MAX_TOKENS  = 1024
@@ -104,6 +105,19 @@ MAX_TOKENS  = 1024
 
 def get_model(chat_id: int) -> str:
     return user_model.get(chat_id, DEFAULT_CHAT_MODEL)
+
+
+def get_cursed(chat_id: int) -> bool:
+    return cursed_mode.get(chat_id, True)
+
+
+def cursed_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    on = get_cursed(chat_id)
+    text = "🔴 Выключить всратый режим" if on else "🟢 Включить всратый режим"
+    action = "off" if on else "on"
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(text, callback_data=f"cursed:{action}")]]
+    )
 
 
 def get_model_label(chat_id: int) -> str:
@@ -310,6 +324,30 @@ async def callback_set_model(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def cmd_cursed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    state = "включён 😈" if get_cursed(chat_id) else "выключен"
+    await update.message.reply_text(
+        f"Всратый режим сейчас {state}.\n\n"
+        "Когда включён, бот переделывает любое присланное фото (если его прямо ни о чём "
+        "не просят) в смешную абсурдную версию. Если попросить что-то конкретное — "
+        "отредактирует по запросу в любом случае.",
+        reply_markup=cursed_keyboard(chat_id),
+    )
+
+
+async def callback_cursed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    cursed_mode[chat_id] = (query.data.split(":", 1)[1] == "on")
+    state = "включён 😈" if cursed_mode[chat_id] else "выключен"
+    await query.edit_message_text(
+        f"Всратый режим {state}.",
+        reply_markup=cursed_keyboard(chat_id),
+    )
+
+
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     conversations[update.effective_chat.id].clear()
     await update.message.reply_text("🗑️ История очищена. Начинаем заново!")
@@ -433,6 +471,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         prompt = caption
 
+    # No explicit request + cursed mode off → stay quiet.
+    if not prompt and not get_cursed(chat_id):
+        return
+
     try:
         raw = await download_tg_file(context, file_id)
         src_url = _data_url(raw, mime)
@@ -514,6 +556,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/reset — очистить историю\n"
         "/info — текущие модели и статистика\n"
         "/imagine <промпт> [--ratio 16:9] — сгенерировать картинку\n"
+        "/cursed — включить/выключить всратый режим 😈\n"
         "/help — эта справка"
     )
 
@@ -529,6 +572,7 @@ async def _post_init(app) -> None:
         BotCommand("start",   "Запустить бота"),
         BotCommand("model",   "Выбрать модель"),
         BotCommand("imagine", "Сгенерировать картинку"),
+        BotCommand("cursed",  "Всратый режим вкл/выкл"),
         BotCommand("reset",   "Очистить историю"),
         BotCommand("info",    "Модели и статистика"),
         BotCommand("help",    "Справка"),
@@ -547,7 +591,9 @@ def main() -> None:
     app.add_handler(CommandHandler("reset",   cmd_reset))
     app.add_handler(CommandHandler("info",    cmd_info))
     app.add_handler(CommandHandler("imagine", cmd_imagine))
+    app.add_handler(CommandHandler("cursed",  cmd_cursed))
     app.add_handler(CallbackQueryHandler(callback_set_model, pattern=r"^setmodel:"))
+    app.add_handler(CallbackQueryHandler(callback_cursed, pattern=r"^cursed:"))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
