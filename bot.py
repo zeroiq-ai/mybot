@@ -820,6 +820,7 @@ async def mp3_to_ogg(mp3: bytes) -> bytes | None:
         return None
     proc = await asyncio.create_subprocess_exec(
         exe, "-loglevel", "error", "-f", "mp3", "-i", "pipe:0",
+        "-filter:a", "atempo=1.5",          # speed up ~1.5x (keeps pitch)
         "-c:a", "libopus", "-b:a", "32k", "-f", "ogg", "pipe:1",
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -2009,15 +2010,14 @@ async def cmd_say(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         spoken = strip_md(answer)
         mp3 = await synth_speech(chat_id, spoken)
         ogg = await mp3_to_ogg(mp3)
-        caption = spoken[:1024]
         if ogg:
             bio = io.BytesIO(ogg)
             bio.name = "voice.ogg"
-            await update.message.reply_voice(voice=bio, caption=caption)
+            await update.message.reply_voice(voice=bio)
         else:
             bio = io.BytesIO(mp3)
             bio.name = "voice.mp3"
-            await update.message.reply_audio(audio=bio, caption=caption)
+            await update.message.reply_audio(audio=bio)
     except httpx.HTTPStatusError as e:
         detail = _openrouter_error_text(e.response)
         logger.error("TTS API error: %s — %s", e.response.status_code, detail)
