@@ -132,20 +132,33 @@ GREETING_PROMPT = (
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 # ── Per-user state: model + conversation history ──────────────────────────────
-conversations: dict[int, list[dict]] = defaultdict(list)
+# History is keyed per (chat_id, user_id) so users in a group get separate threads.
+conversations: dict[tuple[int, int], list[dict]] = defaultdict(list)
 user_model:    dict[int, str]        = {}   # chat_id → model id
+image_model:   dict[int, str]        = {}   # chat_id → image model id
 cursed_mode:   dict[int, bool]       = {}   # chat_id → auto "cursed" remix (default ON)
 last_active:   dict[int, float]      = {}   # chat_id → epoch seconds of last activity
 morning_mode:  dict[int, bool]       = {}   # chat_id → daily greeting on/off (default ON)
 web_mode:      dict[int, bool]       = {}   # chat_id → web search on/off (default OFF)
-memories:      dict[int, list[str]]  = defaultdict(list)  # chat_id → remembered facts
+memories:      dict[int, list[str]]  = defaultdict(list)  # user_id → remembered facts
+automem_mode:  dict[int, bool]       = {}   # user_id → auto-memory on/off (default ON)
 last_gen:      dict[int, dict]       = {}   # chat_id → last image request (for "more")
 _img_cooldown: dict[int, float]      = {}   # chat_id → last image-op timestamp
 
 MAX_HISTORY    = 40
 MAX_TOKENS     = 1024
-IMAGE_COOLDOWN = 20    # seconds between image operations per chat
-MAX_MEMORIES   = 30    # max remembered facts per chat
+IMAGE_COOLDOWN = 20      # seconds between image operations per chat
+MAX_MEMORIES   = 30      # max remembered facts per user
+DOC_CHUNK      = 12000   # chars per chunk when summarizing long documents
+DOC_MAX_CHUNKS = 12      # cap chunks to bound cost on huge documents
+
+# Image models offered via /imgmodel. "res" = endpoint accepts a resolution tier.
+IMAGE_MODELS = [
+    {"id": "google/gemini-2.5-flash-image", "label": "🍌 Gemini Flash (Nano Banana)", "res": False},
+    {"id": "bytedance-seed/seedream-4.5",   "label": "🌊 Seedream 4.5",                "res": True},
+    {"id": "black-forest-labs/flux.2-pro",  "label": "⚡ FLUX.2 Pro",                  "res": False},
+]
+ALLOWED_RESOLUTIONS = {"512", "1K", "2K", "4K"}
 
 # ── Persistence (SQLite) ──────────────────────────────────────────────────────
 # NOTE: on Railway the filesystem is ephemeral. Attach a Volume and point
@@ -193,18 +206,25 @@ def db_init() -> None:
                 fact    TEXT,
                 ts      REAL
             );
-            CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id);
+            CREATE TABLE IF NOT EXISTS user_prefs (
+                user_id INTEGER PRIMARY KEY,
+                automem INTEGER
+            );
             CREATE INDEX IF NOT EXISTS idx_usage_chat ON usage_log(chat_id, ts);
-            CREATE INDEX IF NOT EXISTS idx_mem_chat ON memories(chat_id, id);
             """
         )
-        # Migrations for chat_state columns added over time.
+        # Migrations for columns added over time.
         _add_column("chat_state", "morning", "INTEGER")
         _add_column("chat_state", "web", "INTEGER")
+        _add_column("chat_state", "img_model", "TEXT")
+        _add_column("messages", "user_id", "INTEGER")
+        _add_column("memories", "user_id", "INTEGER")
+        _db.execute("CREATE INDEX IF NOT EXISTS idx_messages_key ON messages(chat_id, user_id, id)")
+        _db.execute("CREATE INDEX IF NOT EXISTS idx_mem_user ON memories(user_id, id)")
         _db.commit()
 
-        for chat_id, model, cursed, la, morning, web in _db.execute(
-            "SELECT chat_id, model, cursed, last_active, morning, web FROM chat_state"
+        for chat_id, model, cursed, la, morning, web, imgm in _db.execute(
+            "SELECT chat_id, model, cursed, last_active, morning, web, img_model FROM chat_state"
         ):
             if model:
                 user_model[chat_id] = model
@@ -216,30 +236,49 @@ def db_init() -> None:
                 morning_mode[chat_id] = bool(morning)
             if web is not None:
                 web_mode[chat_id] = bool(web)
-        for chat_id, role, content in _db.execute(
-            "SELECT chat_id, role, content FROM messages ORDER BY id"
+            if imgm:
+                image_model[chat_id] = imgm
+        # Old rows have NULL user_id; private chats have chat_id == user_id, so
+        # coalescing NULL→chat_id keeps legacy history reachable.
+        for chat_id, user_id, role, content in _db.execute(
+            "SELECT chat_id, COALESCE(user_id, chat_id), role, content FROM messages ORDER BY id"
         ):
-            conversations[chat_id].append({"role": role, "content": content})
-        for chat_id, fact in _db.execute(
-            "SELECT chat_id, fact FROM memories ORDER BY id"
+            conversations[(chat_id, user_id)].append({"role": role, "content": content})
+        for user_id, fact in _db.execute(
+            "SELECT COALESCE(user_id, chat_id), fact FROM memories ORDER BY id"
         ):
-            memories[chat_id].append(fact)
-    known_chats = set(user_model) | set(cursed_mode) | set(last_active)
+            memories[user_id].append(fact)
+        for user_id, automem in _db.execute("SELECT user_id, automem FROM user_prefs"):
+            if automem is not None:
+                automem_mode[user_id] = bool(automem)
     stored_msgs = sum(len(v) for v in conversations.values())
-    logger.info("DB loaded: %d chats, %d stored messages", len(known_chats), stored_msgs)
+    logger.info("DB loaded: %d chat settings, %d threads, %d messages",
+                len(set(user_model) | set(cursed_mode) | set(last_active)),
+                len(conversations), stored_msgs)
 
 
 def save_chat_state(chat_id: int) -> None:
     with _db_lock:
         _db.execute(
-            "INSERT INTO chat_state(chat_id, model, cursed, last_active, morning, web) "
-            "VALUES(?,?,?,?,?,?) "
+            "INSERT INTO chat_state(chat_id, model, cursed, last_active, morning, web, img_model) "
+            "VALUES(?,?,?,?,?,?,?) "
             "ON CONFLICT(chat_id) DO UPDATE SET "
             "model=excluded.model, cursed=excluded.cursed, last_active=excluded.last_active, "
-            "morning=excluded.morning, web=excluded.web",
+            "morning=excluded.morning, web=excluded.web, img_model=excluded.img_model",
             (chat_id, user_model.get(chat_id),
              1 if get_cursed(chat_id) else 0, last_active.get(chat_id),
-             1 if get_morning(chat_id) else 0, 1 if get_web(chat_id) else 0),
+             1 if get_morning(chat_id) else 0, 1 if get_web(chat_id) else 0,
+             image_model.get(chat_id)),
+        )
+        _db.commit()
+
+
+def save_user_pref(user_id: int) -> None:
+    with _db_lock:
+        _db.execute(
+            "INSERT INTO user_prefs(user_id, automem) VALUES(?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET automem=excluded.automem",
+            (user_id, 1 if get_automem(user_id) else 0),
         )
         _db.commit()
 
@@ -268,39 +307,39 @@ def get_spend(chat_id: int) -> tuple[float, float, float]:
     return today, total, grand
 
 
-def add_memory(chat_id: int, fact: str) -> None:
-    memories[chat_id].append(fact)
+def add_memory(user_id: int, fact: str) -> None:
+    memories[user_id].append(fact)
     with _db_lock:
-        _db.execute("INSERT INTO memories(chat_id, fact, ts) VALUES(?,?,?)",
-                    (chat_id, fact, time.time()))
+        _db.execute("INSERT INTO memories(user_id, fact, ts) VALUES(?,?,?)",
+                    (user_id, fact, time.time()))
         _db.commit()
 
 
-def clear_memories(chat_id: int) -> None:
-    memories[chat_id].clear()
+def clear_memories(user_id: int) -> None:
+    memories[user_id].clear()
     with _db_lock:
-        _db.execute("DELETE FROM memories WHERE chat_id=?", (chat_id,))
+        _db.execute("DELETE FROM memories WHERE user_id=?", (user_id,))
         _db.commit()
 
 
-def save_message(chat_id: int, role: str, content: str) -> None:
+def save_message(chat_id: int, user_id: int, role: str, content: str) -> None:
     with _db_lock:
         _db.execute(
-            "INSERT INTO messages(chat_id, role, content, ts) VALUES(?,?,?,?)",
-            (chat_id, role, content, time.time()),
+            "INSERT INTO messages(chat_id, user_id, role, content, ts) VALUES(?,?,?,?,?)",
+            (chat_id, user_id, role, content, time.time()),
         )
-        # Keep only the most recent MAX_HISTORY rows per chat.
+        # Keep only the most recent MAX_HISTORY rows per (chat, user) thread.
         _db.execute(
-            "DELETE FROM messages WHERE chat_id=? AND id NOT IN "
-            "(SELECT id FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT ?)",
-            (chat_id, chat_id, MAX_HISTORY),
+            "DELETE FROM messages WHERE chat_id=? AND user_id=? AND id NOT IN "
+            "(SELECT id FROM messages WHERE chat_id=? AND user_id=? ORDER BY id DESC LIMIT ?)",
+            (chat_id, user_id, chat_id, user_id, MAX_HISTORY),
         )
         _db.commit()
 
 
-def clear_messages(chat_id: int) -> None:
+def clear_messages(chat_id: int, user_id: int) -> None:
     with _db_lock:
-        _db.execute("DELETE FROM messages WHERE chat_id=?", (chat_id,))
+        _db.execute("DELETE FROM messages WHERE chat_id=? AND user_id=?", (chat_id, user_id))
         _db.commit()
 
 
@@ -320,9 +359,22 @@ def get_web(chat_id: int) -> bool:
     return web_mode.get(chat_id, False)
 
 
-def build_system(chat_id: int) -> str:
-    """System prompt with any remembered facts appended."""
-    facts = memories.get(chat_id)
+def get_automem(user_id: int) -> bool:
+    return automem_mode.get(user_id, True)
+
+
+def get_image_model(chat_id: int) -> str:
+    return image_model.get(chat_id, IMAGE_MODEL)
+
+
+def _image_model_supports_res(chat_id: int) -> bool:
+    mid = get_image_model(chat_id)
+    return any(m["id"] == mid and m["res"] for m in IMAGE_MODELS)
+
+
+def build_system(user_id: int) -> str:
+    """System prompt with this user's remembered facts appended."""
+    facts = memories.get(user_id)
     if not facts:
         return SYSTEM_PROMPT
     return SYSTEM_PROMPT + "\n\nЗапомненные факты о пользователе:\n" + \
@@ -401,6 +453,23 @@ def more_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def automem_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    on = get_automem(user_id)
+    text = "🔴 Выключить авто-память" if on else "🟢 Включить авто-память"
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(text, callback_data=f"automem:{'off' if on else 'on'}")]]
+    )
+
+
+def image_model_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    current = get_image_model(chat_id)
+    rows = []
+    for m in IMAGE_MODELS:
+        tick = "✅ " if m["id"] == current else ""
+        rows.append([InlineKeyboardButton(f"{tick}{m['label']}", callback_data=f"setimg:{m['id']}")])
+    return InlineKeyboardMarkup(rows)
+
+
 def get_model_label(chat_id: int) -> str:
     mid = get_model(chat_id)
     for m in AVAILABLE_MODELS:
@@ -423,17 +492,25 @@ def model_keyboard(chat_id: int) -> InlineKeyboardMarkup:
 
 
 # ── Chat helpers ──────────────────────────────────────────────────────────────
-def trim_history(chat_id: int) -> None:
-    if len(conversations[chat_id]) > MAX_HISTORY:
-        conversations[chat_id] = conversations[chat_id][-MAX_HISTORY:]
+def _ids(update: Update) -> tuple[int, int]:
+    """Return (chat_id, user_id). Falls back to chat_id when no user (rare)."""
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    return chat_id, (user.id if user else chat_id)
 
 
-async def ask_model(chat_id: int, user_text: str) -> str:
-    conversations[chat_id].append({"role": "user", "content": user_text})
-    trim_history(chat_id)
-    save_message(chat_id, "user", user_text)
+def trim_history(key: tuple[int, int]) -> None:
+    if len(conversations[key]) > MAX_HISTORY:
+        conversations[key] = conversations[key][-MAX_HISTORY:]
 
-    messages = [{"role": "system", "content": build_system(chat_id)}] + conversations[chat_id]
+
+async def ask_model(chat_id: int, user_id: int, user_text: str) -> str:
+    key = (chat_id, user_id)
+    conversations[key].append({"role": "user", "content": user_text})
+    trim_history(key)
+    save_message(chat_id, user_id, "user", user_text)
+
+    messages = [{"role": "system", "content": build_system(user_id)}] + conversations[key]
 
     response = await with_retry(lambda: client.chat.completions.create(
         model=chat_model_id(chat_id),
@@ -446,19 +523,20 @@ async def ask_model(chat_id: int, user_text: str) -> str:
     reply = response.choices[0].message.content
     if not reply:
         reply = "⚠️ Модель вернула пустой ответ. Попробуй переформулировать."
-    conversations[chat_id].append({"role": "assistant", "content": reply})
-    save_message(chat_id, "assistant", reply)
+    conversations[key].append({"role": "assistant", "content": reply})
+    save_message(chat_id, user_id, "assistant", reply)
     log_cost(chat_id, "chat", _cost_from_response(response))
     return reply
 
 
-async def stream_reply(update: Update, chat_id: int, user_text: str) -> None:
+async def stream_reply(update: Update, chat_id: int, user_id: int, user_text: str) -> None:
     """Like ask_model, but edits the Telegram message as tokens stream in."""
-    conversations[chat_id].append({"role": "user", "content": user_text})
-    trim_history(chat_id)
-    save_message(chat_id, "user", user_text)
+    key = (chat_id, user_id)
+    conversations[key].append({"role": "user", "content": user_text})
+    trim_history(key)
+    save_message(chat_id, user_id, "user", user_text)
 
-    messages = [{"role": "system", "content": build_system(chat_id)}] + conversations[chat_id]
+    messages = [{"role": "system", "content": build_system(user_id)}] + conversations[key]
 
     stream = await with_retry(lambda: client.chat.completions.create(
         model=chat_model_id(chat_id),
@@ -496,9 +574,42 @@ async def stream_reply(update: Update, chat_id: int, user_text: str) -> None:
     for i in range(TG_MAX_LEN, len(acc), TG_MAX_LEN):
         await update.message.reply_text(acc[i:i + TG_MAX_LEN])
 
-    conversations[chat_id].append({"role": "assistant", "content": acc})
-    save_message(chat_id, "assistant", acc)
+    conversations[key].append({"role": "assistant", "content": acc})
+    save_message(chat_id, user_id, "assistant", acc)
     log_cost(chat_id, "chat", cost)
+
+
+# ── Auto-memory: extract durable facts about the user in the background ────────
+AUTOMEM_PROMPT = (
+    "Из сообщения пользователя выдели устойчивые факты о нём, которые стоит запомнить "
+    "надолго (имя, город, профессия, увлечения, явные предпочтения по общению). "
+    "Игнорируй сиюминутное и вопросы. Верни каждый факт с новой строки, кратко "
+    "и от третьего лица. Если запоминать нечего — верни ровно NONE.\n\nСообщение: "
+)
+
+
+async def auto_extract_memory(chat_id: int, user_id: int, text: str) -> None:
+    if not get_automem(user_id) or len(text) < 12:
+        return
+    if len(memories.get(user_id, [])) >= MAX_MEMORIES:
+        return
+    try:
+        out = await gen_text(AUTOMEM_PROMPT + text, max_tokens=160,
+                             temperature=0.2, chat_id=chat_id, kind="automem")
+    except Exception:
+        logger.exception("Auto-memory extraction failed")
+        return
+    existing = [m.lower() for m in memories.get(user_id, [])]
+    for line in out.splitlines():
+        fact = line.strip().lstrip("-•* ").strip()
+        if not fact or fact.upper() == "NONE" or len(fact) > 200:
+            continue
+        if any(fact.lower() in e or e in fact.lower() for e in existing):
+            continue
+        if len(memories.get(user_id, [])) >= MAX_MEMORIES:
+            break
+        add_memory(user_id, fact)
+        existing.append(fact.lower())
 
 
 # ── Media helpers ─────────────────────────────────────────────────────────────
@@ -548,17 +659,56 @@ def _touch(chat_id: int) -> None:
     save_chat_state(chat_id)
 
 
+def _pdf_to_text(raw: bytes) -> str:
+    """Extract text from a PDF (sync; run via asyncio.to_thread)."""
+    from pypdf import PdfReader
+    reader = PdfReader(io.BytesIO(raw))
+    return "\n".join((page.extract_text() or "") for page in reader.pages)
+
+
+async def answer_over_text(question: str, text: str, name: str, chat_id: int) -> str:
+    """Answer a question over (possibly long) document text via map-reduce."""
+    text = text.strip()
+    if not text:
+        return ""
+    if len(text) <= DOC_CHUNK * 2:
+        return await ask_multimodal(
+            [{"type": "text", "text": f"{question}\n\nСодержимое файла {name}:\n{text}"}],
+            max_tokens=1500, chat_id=chat_id, kind="doc")
+
+    chunks = [text[i:i + DOC_CHUNK] for i in range(0, len(text), DOC_CHUNK)]
+    truncated = len(chunks) > DOC_MAX_CHUNKS
+    chunks = chunks[:DOC_MAX_CHUNKS]
+    partials = []
+    for idx, chunk in enumerate(chunks):
+        part = await ask_multimodal([{"type": "text", "text": (
+            f"Это часть {idx + 1} из {len(chunks)} документа «{name}». "
+            f"Выпиши кратко всё, что относится к запросу: {question}\n\n{chunk}")}],
+            max_tokens=600, chat_id=chat_id, kind="doc")
+        partials.append(part)
+    answer = await ask_multimodal([{"type": "text", "text": (
+        f"На основе выжимок из документа «{name}» ответь на запрос: {question}\n\n"
+        + "\n\n".join(partials))}], max_tokens=1500, chat_id=chat_id, kind="doc")
+    if truncated:
+        answer += f"\n\n⚠️ Документ очень большой — обработаны первые {DOC_MAX_CHUNKS} фрагментов."
+    return answer
+
+
 # ── Image generation ──────────────────────────────────────────────────────────
 async def generate_image(
     prompt: str,
     aspect_ratio: str = "1:1",
     references: list[str] | None = None,
+    model: str | None = None,
+    resolution: str | None = None,
 ) -> tuple[bytes, float]:
     """Returns (image_bytes, cost_usd)."""
     payload = {
-        "model": IMAGE_MODEL,
+        "model": model or IMAGE_MODEL,
         "prompt": prompt,
     }
+    if resolution in ALLOWED_RESOLUTIONS:
+        payload["resolution"] = resolution
     if references:
         # Image-to-image: keep the source image's geometry, don't force a ratio.
         payload["input_references"] = [
@@ -696,6 +846,28 @@ async def callback_set_model(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def cmd_imgmodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    label = next((m["label"] for m in IMAGE_MODELS if m["id"] == get_image_model(chat_id)),
+                 get_image_model(chat_id))
+    await update.message.reply_text(
+        f"Текущая модель картинок: {label}\n\nВыбери модель для /imagine и редактирования:",
+        reply_markup=image_model_keyboard(chat_id),
+    )
+
+
+async def callback_set_img(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    image_model[chat_id] = query.data.split(":", 1)[1]
+    save_chat_state(chat_id)
+    label = next((m["label"] for m in IMAGE_MODELS if m["id"] == image_model[chat_id]),
+                 image_model[chat_id])
+    await query.edit_message_text(
+        f"✅ Модель картинок: {label}", reply_markup=image_model_keyboard(chat_id))
+
+
 async def cmd_cursed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     state = "включён 😈" if get_cursed(chat_id) else "выключен"
@@ -722,21 +894,24 @@ async def callback_cursed(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    conversations[chat_id].clear()
-    clear_messages(chat_id)
+    chat_id, user_id = _ids(update)
+    conversations[(chat_id, user_id)].clear()
+    clear_messages(chat_id, user_id)
     await update.message.reply_text("🗑️ История очищена. Начинаем заново!")
 
 
 async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    count = len(conversations[chat_id])
+    chat_id, user_id = _ids(update)
+    count = len(conversations.get((chat_id, user_id), []))
+    img_label = next((m["label"] for m in IMAGE_MODELS if m["id"] == get_image_model(chat_id)),
+                     get_image_model(chat_id))
     await update.message.reply_text(
         f"🤖 Модель чата:   {get_model_label(chat_id)}\n"
-        f"🎨 Модель картинок: {IMAGE_MODEL}\n"
+        f"🎨 Модель картинок: {img_label}\n"
         f"🌐 Веб-поиск: {'вкл' if get_web(chat_id) else 'выкл'}\n"
         f"😈 Всратый режим: {'вкл' if get_cursed(chat_id) else 'выкл'}\n"
-        f"🧠 Запомнено фактов: {len(memories.get(chat_id, []))}\n"
+        f"🧠 Память: {len(memories.get(user_id, []))} фактов "
+        f"(авто: {'вкл' if get_automem(user_id) else 'выкл'})\n"
         f"📊 История: {count} сообщений (макс. {MAX_HISTORY})."
     )
 
@@ -744,8 +919,9 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.message.reply_text(
-            "Использование: /imagine <промпт> [--ratio 16:9]\n\n"
-            "Форматы: 1:1 | 16:9 | 9:16 | 4:3 | 3:4\n\n"
+            "Использование: /imagine <промпт> [--ratio 16:9] [--res 2K]\n\n"
+            "Форматы: 1:1 | 16:9 | 9:16 | 4:3 | 3:4\n"
+            "Разрешение (если модель поддерживает): 1K | 2K | 4K — выбрать модель: /imgmodel\n\n"
             "Пример:\n"
             "  /imagine dragon flying over mountains\n"
             "  /imagine minimalist crypto logo --ratio 1:1"
@@ -759,9 +935,17 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if idx + 1 < len(args):
             aspect_ratio = args[idx + 1]
             args = args[:idx] + args[idx + 2:]
+    resolution = None
+    if "--res" in args:
+        idx = args.index("--res")
+        if idx + 1 < len(args):
+            resolution = args[idx + 1].upper()
+            args = args[:idx] + args[idx + 2:]
 
     prompt = " ".join(args)
     chat_id = update.effective_chat.id
+    model = get_image_model(chat_id)
+    res = resolution if (resolution in ALLOWED_RESOLUTIONS and _image_model_supports_res(chat_id)) else None
 
     rem = _cooldown_left(chat_id)
     if rem > 0:
@@ -775,9 +959,10 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
     try:
-        image_bytes, cost = await generate_image(prompt, aspect_ratio)
+        image_bytes, cost = await generate_image(prompt, aspect_ratio, model=model, resolution=res)
         log_cost(chat_id, "image", cost)
-        last_gen[chat_id] = {"kind": "imagine", "prompt": prompt, "aspect": aspect_ratio, "src": None}
+        last_gen[chat_id] = {"kind": "imagine", "prompt": prompt, "aspect": aspect_ratio,
+                             "src": None, "model": model, "res": res}
         caption = f"🎨 {prompt}"
         if len(caption) > 1024:            # Telegram caption limit
             caption = caption[:1021] + "..."
@@ -811,7 +996,7 @@ async def send_long(message, text: str) -> None:
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
+    chat_id, user_id = _ids(update)
     _touch(chat_id)
     text = update.message.text
     # In groups, only respond when the bot is addressed (mention or reply).
@@ -824,7 +1009,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     try:
-        await stream_reply(update, chat_id, text)
+        await stream_reply(update, chat_id, user_id, text)
+        asyncio.create_task(auto_extract_memory(chat_id, user_id, text))
     except httpx.HTTPStatusError as e:
         detail = _openrouter_error_text(e.response)
         logger.error("Chat API error: %s — %s", e.response.status_code, detail)
@@ -877,12 +1063,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         src_url = _data_url(raw, mime)
         await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
 
+        model = get_image_model(chat_id)
         if prompt:
             # Explicit image-to-image edit
             status = await msg.reply_text(f"🎨 Редактирую по запросу: {prompt}")
-            out, cost = await generate_image(prompt, references=[src_url])
+            out, cost = await generate_image(prompt, references=[src_url], model=model)
             log_cost(chat_id, "image", cost)
-            last_gen[chat_id] = {"kind": "edit", "prompt": prompt, "aspect": "1:1", "src": src_url}
+            last_gen[chat_id] = {"kind": "edit", "prompt": prompt, "aspect": "1:1",
+                                 "src": src_url, "model": model, "res": None}
             await msg.reply_photo(photo=io.BytesIO(out), caption=f"🎨 {prompt}"[:1024],
                                   reply_markup=more_keyboard())
             await status.delete()
@@ -894,9 +1082,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 {"type": "image_url", "image_url": {"url": src_url}},
             ], chat_id=chat_id, kind="vision")).strip() \
                 or "Make this image absurd, cursed and darkly funny, exaggerate everything."
-            out, cost = await generate_image(instruction, references=[src_url])
+            out, cost = await generate_image(instruction, references=[src_url], model=model)
             log_cost(chat_id, "image", cost)
-            last_gen[chat_id] = {"kind": "cursed", "prompt": None, "aspect": "1:1", "src": src_url}
+            last_gen[chat_id] = {"kind": "cursed", "prompt": None, "aspect": "1:1",
+                                 "src": src_url, "model": model, "res": None}
             await msg.reply_photo(photo=io.BytesIO(out), caption=random.choice(CURSED_CAPTIONS),
                                   reply_markup=more_keyboard())
             await status.delete()
@@ -911,7 +1100,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Transcribe a voice note / audio, then answer it like a normal message."""
-    chat_id = update.effective_chat.id
+    chat_id, user_id = _ids(update)
     _touch(chat_id)
     msg = update.message
     media = msg.voice or msg.audio
@@ -938,8 +1127,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
 
         await msg.reply_text(f"🎤 «{transcript}»")
-        reply = await ask_model(chat_id, transcript)
+        reply = await ask_model(chat_id, user_id, transcript)
         await send_long(msg, reply)
+        asyncio.create_task(auto_extract_memory(chat_id, user_id, transcript))
     except httpx.HTTPStatusError as e:
         detail = _openrouter_error_text(e.response)
         logger.error("Voice API error: %s — %s", e.response.status_code, detail)
@@ -959,12 +1149,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📄 PDF или текстовый файл — отвечу по содержимому.\n"
         "🔄 Под картинками есть кнопка «Ещё вариант».\n\n"
         "Команды:\n"
-        "/model — выбрать модель\n"
-        "/imagine <промпт> [--ratio 16:9] — сгенерировать картинку\n"
+        "/model — выбрать модель чата\n"
+        "/imagine <промпт> [--ratio 16:9] [--res 2K] — сгенерировать картинку\n"
+        "/imgmodel — выбрать модель картинок\n"
         "/cursed — всратый режим 😈\n"
         "/web — веб-поиск 🌐\n"
         "/morning — утренние пожелания 🌅\n"
         "/remember <факт>, /memory, /forget — личная память 🧠\n"
+        "/automem — авто-запоминание фактов\n"
         "/stats — расходы 💸\n"
         "/reset — очистить историю\n"
         "/info — текущие модели и статистика\n"
@@ -987,20 +1179,23 @@ async def callback_regen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     await query.answer("Генерирую ещё вариант…")
     _mark_image(chat_id)
+    model = data.get("model")
+    res = data.get("res")
     try:
         kind = data["kind"]
         if kind == "imagine":
-            out, cost = await generate_image(data["prompt"], data.get("aspect", "1:1"))
+            out, cost = await generate_image(data["prompt"], data.get("aspect", "1:1"),
+                                             model=model, resolution=res)
             cap = f"🎨 {data['prompt']}"[:1024]
         elif kind == "edit":
-            out, cost = await generate_image(data["prompt"], references=[data["src"]])
+            out, cost = await generate_image(data["prompt"], references=[data["src"]], model=model)
             cap = f"🎨 {data['prompt']}"[:1024]
         else:  # cursed
             instruction = (await ask_multimodal([
                 {"type": "text", "text": CURSED_PROMPT},
                 {"type": "image_url", "image_url": {"url": data["src"]}},
             ], chat_id=chat_id, kind="vision")).strip() or "Make this image absurd and funny."
-            out, cost = await generate_image(instruction, references=[data["src"]])
+            out, cost = await generate_image(instruction, references=[data["src"]], model=model)
             cap = random.choice(CURSED_CAPTIONS)
         log_cost(chat_id, "image", cost)
         await context.bot.send_photo(chat_id, photo=io.BytesIO(out),
@@ -1078,7 +1273,7 @@ async def callback_web(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cmd_remember(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
+    _, user_id = _ids(update)
     fact = " ".join(context.args).strip()
     if not fact:
         await update.message.reply_text(
@@ -1086,18 +1281,18 @@ async def cmd_remember(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "Например: /remember меня зовут Глеб, люблю краткие ответы"
         )
         return
-    if len(memories[chat_id]) >= MAX_MEMORIES:
+    if len(memories[user_id]) >= MAX_MEMORIES:
         await update.message.reply_text(
             f"Достигнут лимит {MAX_MEMORIES} фактов. Очисти через /forget."
         )
         return
-    add_memory(chat_id, fact)
+    add_memory(user_id, fact)
     await update.message.reply_text(f"🧠 Запомнил: {fact}")
 
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    facts = memories.get(chat_id)
+    _, user_id = _ids(update)
+    facts = memories.get(user_id)
     if not facts:
         await update.message.reply_text("Пока ничего не запомнено. Добавь через /remember <факт>.")
         return
@@ -1106,9 +1301,30 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    clear_memories(chat_id)
+    _, user_id = _ids(update)
+    clear_memories(user_id)
     await update.message.reply_text("🧠 Память очищена.")
+
+
+async def cmd_automem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _, user_id = _ids(update)
+    state = "включена 🧠" if get_automem(user_id) else "выключена"
+    await update.message.reply_text(
+        f"Авто-память сейчас {state}.\n\n"
+        "Когда включена, я сам подмечаю и запоминаю устойчивые факты о тебе из переписки. "
+        "Посмотреть — /memory, очистить — /forget.",
+        reply_markup=automem_keyboard(user_id),
+    )
+
+
+async def callback_automem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, user_id = _ids(update)
+    automem_mode[user_id] = (query.data.split(":", 1)[1] == "on")
+    save_user_pref(user_id)
+    state = "включена 🧠" if automem_mode[user_id] else "выключена"
+    await query.edit_message_text(f"Авто-память {state}.", reply_markup=automem_keyboard(user_id))
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1135,17 +1351,23 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             (".txt", ".md", ".csv", ".json", ".log", ".py", ".js", ".html", ".xml", ".yaml", ".yml"))
 
         if is_pdf:
-            parts = [
-                {"type": "text", "text": question},
-                {"type": "file", "file": {
-                    "filename": name, "file_data": _data_url(raw, "application/pdf")}},
-            ]
-            answer = await ask_multimodal(parts, max_tokens=1500, chat_id=chat_id, kind="doc")
+            try:
+                text = await asyncio.to_thread(_pdf_to_text, raw)
+            except Exception:
+                logger.exception("PDF extract failed")
+                text = ""
+            if text.strip():
+                answer = await answer_over_text(question, text, name, chat_id)
+            else:
+                # Scanned/image PDF — fall back to sending the file to a multimodal model.
+                answer = await ask_multimodal([
+                    {"type": "text", "text": question},
+                    {"type": "file", "file": {
+                        "filename": name, "file_data": _data_url(raw, "application/pdf")}},
+                ], max_tokens=1500, chat_id=chat_id, kind="doc")
         elif is_text:
-            text = raw.decode("utf-8", "replace")[:20000]
-            answer = await ask_multimodal(
-                [{"type": "text", "text": f"{question}\n\nСодержимое файла {name}:\n{text}"}],
-                max_tokens=1500, chat_id=chat_id, kind="doc")
+            text = raw.decode("utf-8", "replace")
+            answer = await answer_over_text(question, text, name, chat_id)
         else:
             await msg.reply_text(
                 f"⚠️ Формат «{mime or name}» пока не поддерживаю. Пришли PDF или текстовый файл.")
@@ -1188,12 +1410,14 @@ async def _post_init(app) -> None:
         BotCommand("start",   "Запустить бота"),
         BotCommand("model",   "Выбрать модель"),
         BotCommand("imagine",  "Сгенерировать картинку"),
+        BotCommand("imgmodel", "Модель картинок"),
         BotCommand("cursed",   "Всратый режим вкл/выкл"),
         BotCommand("web",      "Веб-поиск вкл/выкл"),
         BotCommand("morning",  "Утренние пожелания вкл/выкл"),
         BotCommand("remember", "Запомнить факт"),
         BotCommand("memory",   "Показать память"),
         BotCommand("forget",   "Очистить память"),
+        BotCommand("automem",  "Авто-память вкл/выкл"),
         BotCommand("stats",    "Расходы"),
         BotCommand("reset",    "Очистить историю"),
         BotCommand("info",     "Модели и статистика"),
@@ -1214,6 +1438,7 @@ def main() -> None:
     app.add_handler(CommandHandler("reset",    cmd_reset))
     app.add_handler(CommandHandler("info",     cmd_info))
     app.add_handler(CommandHandler("imagine",  cmd_imagine))
+    app.add_handler(CommandHandler("imgmodel", cmd_imgmodel))
     app.add_handler(CommandHandler("cursed",   cmd_cursed))
     app.add_handler(CommandHandler("stats",    cmd_stats))
     app.add_handler(CommandHandler("morning",  cmd_morning))
@@ -1221,10 +1446,13 @@ def main() -> None:
     app.add_handler(CommandHandler("remember", cmd_remember))
     app.add_handler(CommandHandler("memory",   cmd_memory))
     app.add_handler(CommandHandler("forget",   cmd_forget))
+    app.add_handler(CommandHandler("automem",  cmd_automem))
     app.add_handler(CallbackQueryHandler(callback_set_model, pattern=r"^setmodel:"))
+    app.add_handler(CallbackQueryHandler(callback_set_img, pattern=r"^setimg:"))
     app.add_handler(CallbackQueryHandler(callback_cursed, pattern=r"^cursed:"))
     app.add_handler(CallbackQueryHandler(callback_morning, pattern=r"^morning:"))
     app.add_handler(CallbackQueryHandler(callback_web, pattern=r"^web:"))
+    app.add_handler(CallbackQueryHandler(callback_automem, pattern=r"^automem:"))
     app.add_handler(CallbackQueryHandler(callback_regen, pattern=r"^regen$"))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
