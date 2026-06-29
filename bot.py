@@ -118,6 +118,18 @@ CURSED_CAPTIONS = [
     "не благодари",
 ]
 
+# Personality for spontaneous chat interjections (set from the character poll:
+# sarcastic provocateur, dark humour + mild profanity OK, medium length).
+PERSONALITY_PROMPT = (
+    "Ты — участник группового чата с характером саркастичного остряка и провокатора. "
+    "У тебя есть чёткое мнение, ты можешь спорить и подкалывать, не боишься непопулярных позиций. "
+    "Чёрный юмор и сарказм приветствуются; мат допустим в меру, БЕЗ жести, без оскорблений конкретных "
+    "людей, без дискриминации и без травли. Пиши живым разговорным языком, 2–4 предложения. "
+    "Тебе показывают последние сообщения чата — вбрось своё мнение по обсуждаемой теме: можно поддеть, "
+    "поспорить или добавить неожиданный угол. Не представляйся и не здоровайся, пиши как обычный участник, "
+    "реагируй на тему в целом, а не на конкретного человека по имени."
+)
+
 # Daily morning greeting, generated fresh each time for variety.
 GREETING_PROMPT = (
     "Напиши короткое (2–4 предложения) утреннее пожелание хорошего дня для "
@@ -142,8 +154,11 @@ morning_mode:  dict[int, bool]       = {}   # chat_id → daily greeting on/off 
 web_mode:      dict[int, bool]       = {}   # chat_id → web search on/off (default OFF)
 memories:      dict[int, list[str]]  = defaultdict(list)  # user_id → remembered facts
 automem_mode:  dict[int, bool]       = {}   # user_id → auto-memory on/off (default ON)
+spontan_mode:  dict[int, bool]       = {}   # chat_id → spontaneous chime-in on/off (default ON)
 last_gen:      dict[int, dict]       = {}   # chat_id → last image request (for "more")
 _img_cooldown: dict[int, float]      = {}   # chat_id → last image-op timestamp
+_grp_buffer:   dict[int, list[tuple[float, str]]] = defaultdict(list)  # recent group msgs
+_spont_last:   dict[int, float]      = {}   # chat_id → last spontaneous interjection ts
 
 MAX_HISTORY    = 300
 MAX_TOKENS     = 1024
@@ -151,6 +166,14 @@ IMAGE_COOLDOWN = 20      # seconds between image operations per chat
 MAX_MEMORIES   = 30      # max remembered facts per user
 DOC_CHUNK      = 12000   # chars per chunk when summarizing long documents
 DOC_MAX_CHUNKS = 12      # cap chunks to bound cost on huge documents
+
+# Spontaneous "chime-in": if a group sees >= SPONT_THRESHOLD messages within
+# SPONT_WINDOW seconds without the bot, it may drop an opinion — at most once
+# per SPONT_COOLDOWN seconds.
+SPONT_WINDOW    = 180
+SPONT_THRESHOLD = 10
+SPONT_COOLDOWN  = 300
+SPONT_BUFFER    = 30    # max recent messages kept per chat for context
 
 # Image models offered via /imgmodel. "res" = endpoint accepts a resolution tier.
 IMAGE_MODELS = [
@@ -217,14 +240,16 @@ def db_init() -> None:
         _add_column("chat_state", "morning", "INTEGER")
         _add_column("chat_state", "web", "INTEGER")
         _add_column("chat_state", "img_model", "TEXT")
+        _add_column("chat_state", "spontan", "INTEGER")
         _add_column("messages", "user_id", "INTEGER")
         _add_column("memories", "user_id", "INTEGER")
         _db.execute("CREATE INDEX IF NOT EXISTS idx_messages_key ON messages(chat_id, user_id, id)")
         _db.execute("CREATE INDEX IF NOT EXISTS idx_mem_user ON memories(user_id, id)")
         _db.commit()
 
-        for chat_id, model, cursed, la, morning, web, imgm in _db.execute(
-            "SELECT chat_id, model, cursed, last_active, morning, web, img_model FROM chat_state"
+        for chat_id, model, cursed, la, morning, web, imgm, spontan in _db.execute(
+            "SELECT chat_id, model, cursed, last_active, morning, web, img_model, spontan "
+            "FROM chat_state"
         ):
             if model:
                 user_model[chat_id] = model
@@ -238,6 +263,8 @@ def db_init() -> None:
                 web_mode[chat_id] = bool(web)
             if imgm:
                 image_model[chat_id] = imgm
+            if spontan is not None:
+                spontan_mode[chat_id] = bool(spontan)
         # Old rows have NULL user_id; private chats have chat_id == user_id, so
         # coalescing NULL→chat_id keeps legacy history reachable.
         for chat_id, user_id, role, content in _db.execute(
@@ -260,15 +287,17 @@ def db_init() -> None:
 def save_chat_state(chat_id: int) -> None:
     with _db_lock:
         _db.execute(
-            "INSERT INTO chat_state(chat_id, model, cursed, last_active, morning, web, img_model) "
-            "VALUES(?,?,?,?,?,?,?) "
+            "INSERT INTO chat_state"
+            "(chat_id, model, cursed, last_active, morning, web, img_model, spontan) "
+            "VALUES(?,?,?,?,?,?,?,?) "
             "ON CONFLICT(chat_id) DO UPDATE SET "
             "model=excluded.model, cursed=excluded.cursed, last_active=excluded.last_active, "
-            "morning=excluded.morning, web=excluded.web, img_model=excluded.img_model",
+            "morning=excluded.morning, web=excluded.web, img_model=excluded.img_model, "
+            "spontan=excluded.spontan",
             (chat_id, user_model.get(chat_id),
              1 if get_cursed(chat_id) else 0, last_active.get(chat_id),
              1 if get_morning(chat_id) else 0, 1 if get_web(chat_id) else 0,
-             image_model.get(chat_id)),
+             image_model.get(chat_id), 1 if get_chime(chat_id) else 0),
         )
         _db.commit()
 
@@ -361,6 +390,10 @@ def get_web(chat_id: int) -> bool:
 
 def get_automem(user_id: int) -> bool:
     return automem_mode.get(user_id, True)
+
+
+def get_chime(chat_id: int) -> bool:
+    return spontan_mode.get(chat_id, True)
 
 
 def get_image_model(chat_id: int) -> str:
@@ -653,6 +686,25 @@ async def gen_text(prompt: str, max_tokens: int = 300, temperature: float = 1.1,
     return response.choices[0].message.content or ""
 
 
+async def gen_opinion(chat_id: int, transcript: str) -> str:
+    """Generate a spontaneous in-character opinion about the recent chat."""
+    response = await with_retry(lambda: client.chat.completions.create(
+        model=AUX_MODEL,
+        max_tokens=300,
+        temperature=1.0,
+        messages=[
+            {"role": "system", "content": PERSONALITY_PROMPT},
+            {"role": "user", "content":
+                "Последние сообщения чата:\n" + transcript +
+                "\n\nВбрось короткую реплику по обсуждаемой теме."},
+        ],
+        extra_headers={"X-Title": "Telegram Claude Bot"},
+        extra_body={"usage": {"include": True}},
+    ))
+    log_cost(chat_id, "chime", _cost_from_response(response))
+    return response.choices[0].message.content or ""
+
+
 def _touch(chat_id: int) -> None:
     """Mark a chat as active right now (used to pick recipients for daily greeting)."""
     last_active[chat_id] = time.time()
@@ -802,6 +854,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/model — выбрать модель\n"
         "/imagine <prompt> [--ratio 16:9] — сгенерировать картинку\n"
         "/cursed — всратый режим 😈\n"
+        "/chime — спонтанные вбросы в беседу 🗣\n"
         "/web — веб-поиск 🌐\n"
         "/morning — утренние пожелания 🌅\n"
         "/remember, /memory, /forget — личная память 🧠\n"
@@ -995,6 +1048,37 @@ async def send_long(message, text: str) -> None:
         await message.reply_text(text[i:i + TG_MAX_LEN])
 
 
+async def _maybe_chime_in(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                          chat_id: int, text: str) -> None:
+    """Track group chatter and occasionally drop a spontaneous opinion."""
+    if not get_chime(chat_id) or not text:
+        return
+    now = time.time()
+    user = update.effective_user
+    name = (user.first_name or user.username or "кто-то") if user else "кто-то"
+    buf = _grp_buffer[chat_id]
+    buf.append((now, f"{name}: {text}"))
+    # Keep only messages within the time window (and cap the buffer size).
+    cutoff = now - SPONT_WINDOW
+    buf[:] = [(ts, t) for ts, t in buf if ts >= cutoff][-SPONT_BUFFER:]
+
+    if len(buf) < SPONT_THRESHOLD:
+        return
+    if now - _spont_last.get(chat_id, 0) < SPONT_COOLDOWN:
+        return
+
+    transcript = "\n".join(t for _, t in buf)
+    _spont_last[chat_id] = now
+    buf.clear()                       # reset: these count as "with the bot's input"
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        opinion = (await gen_opinion(chat_id, transcript)).strip()
+        if opinion:
+            await context.bot.send_message(chat_id, opinion)
+    except Exception:
+        logger.exception("Chime-in failed for chat %s", chat_id)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id, user_id = _ids(update)
     _touch(chat_id)
@@ -1002,11 +1086,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # In groups, only respond when the bot is addressed (mention or reply).
     if _is_group(update):
         if not _addressed_to_bot(update, context):
+            await _maybe_chime_in(update, context, chat_id, text)
             return
         text = _strip_bot_mention(text, context)
         if not text:
             await update.message.reply_text("Да? Напиши вопрос вместе с упоминанием.")
             return
+        _grp_buffer[chat_id].clear()   # bot is participating → reset chatter counter
+        _spont_last[chat_id] = time.time()
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     try:
         await stream_reply(update, chat_id, user_id, text)
@@ -1153,6 +1240,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/imagine <промпт> [--ratio 16:9] [--res 2K] — сгенерировать картинку\n"
         "/imgmodel — выбрать модель картинок\n"
         "/cursed — всратый режим 😈\n"
+        "/chime — спонтанные вбросы в беседу 🗣\n"
         "/web — веб-поиск 🌐\n"
         "/morning — утренние пожелания 🌅\n"
         "/remember <факт>, /memory, /forget — личная память 🧠\n"
@@ -1270,6 +1358,36 @@ async def callback_web(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     save_chat_state(chat_id)
     state = "включён 🌐" if web_mode[chat_id] else "выключен"
     await query.edit_message_text(f"Веб-поиск {state}.", reply_markup=web_keyboard(chat_id))
+
+
+def chime_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    on = get_chime(chat_id)
+    text = "🔴 Выключить вбросы" if on else "🟢 Включить вбросы"
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(text, callback_data=f"chime:{'off' if on else 'on'}")]]
+    )
+
+
+async def cmd_chime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    state = "включены 🗣" if get_chime(chat_id) else "выключены"
+    await update.message.reply_text(
+        f"Спонтанные вбросы сейчас {state}.\n\n"
+        f"Когда включены, если в чате за ~{SPONT_WINDOW // 60} мин набирается "
+        f"{SPONT_THRESHOLD}+ сообщений без меня — я могу вставить своё мнение по теме "
+        f"(не чаще раза в {SPONT_COOLDOWN // 60} мин).",
+        reply_markup=chime_keyboard(chat_id),
+    )
+
+
+async def callback_chime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    spontan_mode[chat_id] = (query.data.split(":", 1)[1] == "on")
+    save_chat_state(chat_id)
+    state = "включены 🗣" if spontan_mode[chat_id] else "выключены"
+    await query.edit_message_text(f"Спонтанные вбросы {state}.", reply_markup=chime_keyboard(chat_id))
 
 
 async def cmd_remember(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1412,6 +1530,7 @@ async def _post_init(app) -> None:
         BotCommand("imagine",  "Сгенерировать картинку"),
         BotCommand("imgmodel", "Модель картинок"),
         BotCommand("cursed",   "Всратый режим вкл/выкл"),
+        BotCommand("chime",    "Спонтанные вбросы вкл/выкл"),
         BotCommand("web",      "Веб-поиск вкл/выкл"),
         BotCommand("morning",  "Утренние пожелания вкл/выкл"),
         BotCommand("remember", "Запомнить факт"),
@@ -1440,6 +1559,7 @@ def main() -> None:
     app.add_handler(CommandHandler("imagine",  cmd_imagine))
     app.add_handler(CommandHandler("imgmodel", cmd_imgmodel))
     app.add_handler(CommandHandler("cursed",   cmd_cursed))
+    app.add_handler(CommandHandler("chime",    cmd_chime))
     app.add_handler(CommandHandler("stats",    cmd_stats))
     app.add_handler(CommandHandler("morning",  cmd_morning))
     app.add_handler(CommandHandler("web",      cmd_web))
@@ -1452,6 +1572,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(callback_cursed, pattern=r"^cursed:"))
     app.add_handler(CallbackQueryHandler(callback_morning, pattern=r"^morning:"))
     app.add_handler(CallbackQueryHandler(callback_web, pattern=r"^web:"))
+    app.add_handler(CallbackQueryHandler(callback_chime, pattern=r"^chime:"))
     app.add_handler(CallbackQueryHandler(callback_automem, pattern=r"^automem:"))
     app.add_handler(CallbackQueryHandler(callback_regen, pattern=r"^regen$"))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
