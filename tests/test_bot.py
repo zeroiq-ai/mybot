@@ -36,6 +36,30 @@ def test_build_system_includes_memory():
     assert bot.build_system(uid) == bot.SYSTEM_PROMPT
 
 
+def test_build_system_includes_chime_context():
+    uid, cid = 5551, 7771
+    bot.memories.pop(uid, None)
+    bot.chime_context[cid] = ["считаю, что котики лучше собак"]
+    sys = bot.build_system(uid, cid)
+    assert "котики лучше собак" in sys
+    # without chat_id, chat-level notes are not injected
+    assert "котики" not in bot.build_system(uid)
+    bot.chime_context.pop(cid, None)
+
+
+def test_chime_note_persists_and_caps():
+    cid = 8881
+    bot._db.execute("DELETE FROM group_notes WHERE chat_id=?", (cid,))
+    bot._db.commit()
+    bot.chime_context.pop(cid, None)
+    for i in range(bot.MAX_CHIME_NOTES + 3):
+        bot.add_chime_note(cid, f"мнение {i}")
+    assert len(bot.chime_context[cid]) == bot.MAX_CHIME_NOTES
+    rows = bot._db.execute(
+        "SELECT COUNT(*) FROM group_notes WHERE chat_id=?", (cid,)).fetchone()[0]
+    assert rows == bot.MAX_CHIME_NOTES
+
+
 def test_defaults():
     assert bot.get_cursed(999) is True       # cursed default ON
     assert bot.get_web(999) is False         # web default OFF

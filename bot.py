@@ -159,6 +159,7 @@ last_gen:      dict[int, dict]       = {}   # chat_id → last image request (fo
 _img_cooldown: dict[int, float]      = {}   # chat_id → last image-op timestamp
 _grp_buffer:   dict[int, list[tuple[float, str]]] = defaultdict(list)  # recent group msgs
 _spont_last:   dict[int, float]      = {}   # chat_id → last spontaneous interjection ts
+chime_context: dict[int, list[str]]  = defaultdict(list)  # chat_id → bot's recent chime-ins
 
 MAX_HISTORY    = 300
 MAX_TOKENS     = 1024
@@ -166,6 +167,7 @@ IMAGE_COOLDOWN = 20      # seconds between image operations per chat
 MAX_MEMORIES   = 30      # max remembered facts per user
 DOC_CHUNK      = 12000   # chars per chunk when summarizing long documents
 DOC_MAX_CHUNKS = 12      # cap chunks to bound cost on huge documents
+MAX_CHIME_NOTES = 5      # how many recent chime-ins to remember per chat
 
 # Spontaneous "chime-in": if a group sees >= SPONT_THRESHOLD messages within
 # SPONT_WINDOW seconds without the bot, it may drop an opinion — at most once
@@ -233,6 +235,13 @@ def db_init() -> None:
                 user_id INTEGER PRIMARY KEY,
                 automem INTEGER
             );
+            CREATE TABLE IF NOT EXISTS group_notes (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                text    TEXT,
+                ts      REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_notes_chat ON group_notes(chat_id, id);
             CREATE INDEX IF NOT EXISTS idx_usage_chat ON usage_log(chat_id, ts);
             """
         )
@@ -278,6 +287,10 @@ def db_init() -> None:
         for user_id, automem in _db.execute("SELECT user_id, automem FROM user_prefs"):
             if automem is not None:
                 automem_mode[user_id] = bool(automem)
+        for chat_id, text in _db.execute(
+            "SELECT chat_id, text FROM group_notes ORDER BY id"
+        ):
+            chime_context[chat_id].append(text)
     stored_msgs = sum(len(v) for v in conversations.values())
     logger.info("DB loaded: %d chat settings, %d threads, %d messages",
                 len(set(user_model) | set(cursed_mode) | set(last_active)),
@@ -351,6 +364,21 @@ def clear_memories(user_id: int) -> None:
         _db.commit()
 
 
+def add_chime_note(chat_id: int, text: str) -> None:
+    """Remember (per chat) what the bot spontaneously said, capped to the last few."""
+    chime_context[chat_id].append(text)
+    chime_context[chat_id][:] = chime_context[chat_id][-MAX_CHIME_NOTES:]
+    with _db_lock:
+        _db.execute("INSERT INTO group_notes(chat_id, text, ts) VALUES(?,?,?)",
+                    (chat_id, text, time.time()))
+        _db.execute(
+            "DELETE FROM group_notes WHERE chat_id=? AND id NOT IN "
+            "(SELECT id FROM group_notes WHERE chat_id=? ORDER BY id DESC LIMIT ?)",
+            (chat_id, chat_id, MAX_CHIME_NOTES),
+        )
+        _db.commit()
+
+
 def save_message(chat_id: int, user_id: int, role: str, content: str) -> None:
     with _db_lock:
         _db.execute(
@@ -405,13 +433,18 @@ def _image_model_supports_res(chat_id: int) -> bool:
     return any(m["id"] == mid and m["res"] for m in IMAGE_MODELS)
 
 
-def build_system(user_id: int) -> str:
-    """System prompt with this user's remembered facts appended."""
+def build_system(user_id: int, chat_id: int | None = None) -> str:
+    """System prompt with this user's facts and the chat's recent chime-ins."""
+    parts = [SYSTEM_PROMPT]
     facts = memories.get(user_id)
-    if not facts:
-        return SYSTEM_PROMPT
-    return SYSTEM_PROMPT + "\n\nЗапомненные факты о пользователе:\n" + \
-        "\n".join(f"- {f}" for f in facts)
+    if facts:
+        parts.append("Запомненные факты о пользователе:\n" +
+                     "\n".join(f"- {f}" for f in facts))
+    notes = chime_context.get(chat_id) if chat_id is not None else None
+    if notes:
+        parts.append("Ранее в этом чате ты сам высказывал такие мнения:\n" +
+                     "\n".join(f"- {n}" for n in notes))
+    return "\n\n".join(parts)
 
 
 def chat_model_id(chat_id: int) -> str:
@@ -543,7 +576,7 @@ async def ask_model(chat_id: int, user_id: int, user_text: str) -> str:
     trim_history(key)
     save_message(chat_id, user_id, "user", user_text)
 
-    messages = [{"role": "system", "content": build_system(user_id)}] + conversations[key]
+    messages = [{"role": "system", "content": build_system(user_id, chat_id)}] + conversations[key]
 
     response = await with_retry(lambda: client.chat.completions.create(
         model=chat_model_id(chat_id),
@@ -569,7 +602,7 @@ async def stream_reply(update: Update, chat_id: int, user_id: int, user_text: st
     trim_history(key)
     save_message(chat_id, user_id, "user", user_text)
 
-    messages = [{"role": "system", "content": build_system(user_id)}] + conversations[key]
+    messages = [{"role": "system", "content": build_system(user_id, chat_id)}] + conversations[key]
 
     stream = await with_retry(lambda: client.chat.completions.create(
         model=chat_model_id(chat_id),
@@ -1075,6 +1108,7 @@ async def _maybe_chime_in(update: Update, context: ContextTypes.DEFAULT_TYPE,
         opinion = (await gen_opinion(chat_id, transcript)).strip()
         if opinion:
             await context.bot.send_message(chat_id, opinion)
+            add_chime_note(chat_id, opinion)
     except Exception:
         logger.exception("Chime-in failed for chat %s", chat_id)
 
