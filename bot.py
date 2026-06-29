@@ -794,11 +794,21 @@ def _delta_audio_data(delta) -> str | None:
 TTS_SAMPLE_RATE = 24000   # OpenAI audio output is 24kHz mono 16-bit PCM
 
 
-async def tts_pcm(chat_id: int, text: str) -> bytes:
-    """Synthesize speech via an OpenRouter audio model. Returns raw PCM16 bytes.
+def _delta_audio_transcript(delta) -> str | None:
+    audio = getattr(delta, "audio", None)
+    if audio is None and getattr(delta, "model_extra", None):
+        audio = delta.model_extra.get("audio")
+    if audio is None:
+        return None
+    return audio.get("transcript") if isinstance(audio, dict) else getattr(audio, "transcript", None)
 
-    Audio output requires streaming, and with stream=true the only supported
-    format is pcm16, so we collect the base64 fragments and decode them."""
+
+async def tts_pcm(chat_id: int, text: str) -> tuple[bytes, str]:
+    """Synthesize speech via an OpenRouter audio model.
+
+    Returns (raw PCM16 bytes, spoken transcript). Audio output requires streaming
+    and only pcm16 is allowed there, so we collect the base64 fragments. We also
+    capture the transcript of what was actually spoken, to use as the caption."""
     # gpt-audio is a conversational model, so without this instruction it would
     # *answer* the text instead of reading it. Force verbatim narration.
     stream = await with_retry(lambda: client.chat.completions.create(
@@ -819,18 +829,24 @@ async def tts_pcm(chat_id: int, text: str) -> bytes:
             "usage": {"include": True},
         },
     ))
-    b64, cost = "", 0.0
+    b64, transcript, cost = "", "", 0.0
     async for chunk in stream:
         if chunk.choices:
-            part = _delta_audio_data(chunk.choices[0].delta)
+            delta = chunk.choices[0].delta
+            part = _delta_audio_data(delta)
             if part:
                 b64 += part
+            tr = _delta_audio_transcript(delta)
+            if tr:
+                transcript += tr
+            elif getattr(delta, "content", None):
+                transcript += delta.content
         if getattr(chunk, "usage", None):
             cost = _cost_from_response(chunk) or cost
     log_cost(chat_id, "tts", cost)
     if not b64:
         raise ValueError("No audio in TTS stream")
-    return base64.b64decode(b64)
+    return base64.b64decode(b64), transcript.strip()
 
 
 async def pcm_to_ogg(pcm: bytes) -> bytes | None:
@@ -2038,9 +2054,10 @@ async def cmd_say(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             answer = await ask_voice(chat_id, user_id, q)
         answer = answer.strip() or "..."
 
-        pcm = await tts_pcm(chat_id, answer)
+        pcm, spoken = await tts_pcm(chat_id, answer)
         ogg = await pcm_to_ogg(pcm)
-        caption = strip_md(answer)[:1024]
+        # Caption = what was actually voiced, so text and audio always match.
+        caption = strip_md(spoken or answer)[:1024]
         if ogg:
             bio = io.BytesIO(ogg)
             bio.name = "voice.ogg"
