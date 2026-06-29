@@ -167,7 +167,7 @@ IMAGE_COOLDOWN = 20      # seconds between image operations per chat
 MAX_MEMORIES   = 30      # max remembered facts per user
 DOC_CHUNK      = 12000   # chars per chunk when summarizing long documents
 DOC_MAX_CHUNKS = 12      # cap chunks to bound cost on huge documents
-MAX_CHIME_NOTES = 5      # how many recent chime-ins to remember per chat
+MAX_CHIME_NOTES = 20     # how many recent chime-ins to remember per chat
 
 # Spontaneous "chime-in": if a group sees >= SPONT_THRESHOLD messages within
 # SPONT_WINDOW seconds without the bot, it may drop an opinion — at most once
