@@ -790,9 +790,17 @@ async def tts_pcm(chat_id: int, text: str) -> bytes:
 
     Audio output requires streaming, and with stream=true the only supported
     format is pcm16, so we collect the base64 fragments and decode them."""
+    # gpt-audio is a conversational model, so without this instruction it would
+    # *answer* the text instead of reading it. Force verbatim narration.
     stream = await with_retry(lambda: client.chat.completions.create(
         model=TTS_MODEL,
-        messages=[{"role": "user", "content": text}],
+        messages=[
+            {"role": "system", "content":
+                "You are a strict text-to-speech engine. Read the user's message aloud "
+                "VERBATIM, word for word, in its original language. Do not answer, reply, "
+                "translate, summarize, rephrase, or add anything — voice the exact text only."},
+            {"role": "user", "content": text},
+        ],
         stream=True,
         stream_options={"include_usage": True},
         extra_headers={"X-Title": "Telegram Claude Bot"},
