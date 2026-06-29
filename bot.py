@@ -88,6 +88,8 @@ DEFAULT_CHAT_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet
 AUX_MODEL = os.environ.get("OPENROUTER_AUX_MODEL", "google/gemini-2.5-flash")
 
 # /say uses gTTS (reads text verbatim). Language is chosen per chat via /voice.
+VOICE_SPEED = 1.5    # playback speed multiplier
+VOICE_PITCH = 0.82   # <1 lowers pitch → more male timbre
 
 # Telegram hard limit for a single text message.
 TG_MAX_LEN = 4096
@@ -818,9 +820,13 @@ async def mp3_to_ogg(mp3: bytes) -> bytes | None:
     exe = _ffmpeg_exe()
     if not exe:
         return None
+    # Lower the pitch for a male timbre, then restore speed and bump to ~1.5x.
+    base = 24000
+    af = (f"aresample={base},asetrate={int(base * VOICE_PITCH)},aresample={base},"
+          f"atempo={VOICE_SPEED / VOICE_PITCH:.4f}")
     proc = await asyncio.create_subprocess_exec(
         exe, "-loglevel", "error", "-f", "mp3", "-i", "pipe:0",
-        "-filter:a", "atempo=1.5",          # speed up ~1.5x (keeps pitch)
+        "-filter:a", af,
         "-c:a", "libopus", "-b:a", "32k", "-f", "ogg", "pipe:1",
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
