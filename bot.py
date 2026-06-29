@@ -87,10 +87,7 @@ DEFAULT_CHAT_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet
 # (must accept image + audio input). Gemini Flash handles both cheaply.
 AUX_MODEL = os.environ.get("OPENROUTER_AUX_MODEL", "google/gemini-2.5-flash")
 
-# Text-to-speech (audio-output) model + default voice for /say.
-TTS_MODEL = os.environ.get("OPENROUTER_TTS_MODEL", "openai/gpt-audio-mini")
-TTS_VOICE = os.environ.get("OPENROUTER_TTS_VOICE", "ash")
-TTS_VOICES = ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"]
+# /say uses gTTS (reads text verbatim). Language is chosen per chat via /voice.
 
 # Telegram hard limit for a single text message.
 TG_MAX_LEN = 4096
@@ -443,8 +440,21 @@ def get_chime(chat_id: int) -> bool:
     return spontan_mode.get(chat_id, True)
 
 
-def get_voice(chat_id: int) -> str:
-    return chat_voice.get(chat_id, TTS_VOICE)
+TTS_LANGS = ("auto", "ru", "en")
+
+
+def get_lang(chat_id: int) -> str:
+    v = chat_voice.get(chat_id, "auto")   # column reused to store TTS language
+    return v if v in TTS_LANGS else "auto"
+
+
+def pick_lang(text: str, chat_id: int) -> str:
+    mode = get_lang(chat_id)
+    if mode in ("ru", "en"):
+        return mode
+    cyr = sum("а" <= c.lower() <= "я" or c == "ё" for c in text)
+    lat = sum("a" <= c.lower() <= "z" for c in text)
+    return "en" if lat > cyr else "ru"
 
 
 def build_voice_system(user_id: int, chat_id: int | None = None) -> str:
@@ -781,74 +791,6 @@ async def gen_chat(system: str, user_content: str, chat_id: int | None = None,
     return response.choices[0].message.content or ""
 
 
-def _delta_audio_data(delta) -> str | None:
-    """Pull a base64 audio fragment out of a streaming delta, however it's shaped."""
-    audio = getattr(delta, "audio", None)
-    if audio is None and getattr(delta, "model_extra", None):
-        audio = delta.model_extra.get("audio")
-    if audio is None:
-        return None
-    return audio.get("data") if isinstance(audio, dict) else getattr(audio, "data", None)
-
-
-TTS_SAMPLE_RATE = 24000   # OpenAI audio output is 24kHz mono 16-bit PCM
-
-
-def _delta_audio_transcript(delta) -> str | None:
-    audio = getattr(delta, "audio", None)
-    if audio is None and getattr(delta, "model_extra", None):
-        audio = delta.model_extra.get("audio")
-    if audio is None:
-        return None
-    return audio.get("transcript") if isinstance(audio, dict) else getattr(audio, "transcript", None)
-
-
-async def tts_pcm(chat_id: int, text: str) -> tuple[bytes, str]:
-    """Synthesize speech via an OpenRouter audio model.
-
-    Returns (raw PCM16 bytes, spoken transcript). Audio output requires streaming
-    and only pcm16 is allowed there, so we collect the base64 fragments. We also
-    capture the transcript of what was actually spoken, to use as the caption."""
-    # gpt-audio is a conversational model, so without this instruction it would
-    # *answer* the text instead of reading it. Force verbatim narration.
-    stream = await with_retry(lambda: client.chat.completions.create(
-        model=TTS_MODEL,
-        messages=[
-            {"role": "system", "content":
-                "You are a strict text-to-speech engine. Read the user's message aloud "
-                "VERBATIM, word for word, in its original language. Do not answer, reply, "
-                "translate, summarize, rephrase, or add anything — voice the exact text only."},
-            {"role": "user", "content": text},
-        ],
-        stream=True,
-        stream_options={"include_usage": True},
-        extra_headers={"X-Title": "Telegram Claude Bot"},
-        extra_body={
-            "modalities": ["text", "audio"],
-            "audio": {"voice": get_voice(chat_id), "format": "pcm16"},
-            "usage": {"include": True},
-        },
-    ))
-    b64, transcript, cost = "", "", 0.0
-    async for chunk in stream:
-        if chunk.choices:
-            delta = chunk.choices[0].delta
-            part = _delta_audio_data(delta)
-            if part:
-                b64 += part
-            tr = _delta_audio_transcript(delta)
-            if tr:
-                transcript += tr
-            elif getattr(delta, "content", None):
-                transcript += delta.content
-        if getattr(chunk, "usage", None):
-            cost = _cost_from_response(chunk) or cost
-    log_cost(chat_id, "tts", cost)
-    if not b64:
-        raise ValueError("No audio in TTS stream")
-    return base64.b64decode(b64), transcript.strip()
-
-
 def _ffmpeg_exe() -> str | None:
     """Locate an ffmpeg binary: prefer the pip-bundled one, fall back to PATH."""
     try:
@@ -858,34 +800,35 @@ def _ffmpeg_exe() -> str | None:
         return shutil.which("ffmpeg")
 
 
-async def pcm_to_ogg(pcm: bytes) -> bytes | None:
-    """Encode raw PCM16 to OGG/Opus via ffmpeg (for a Telegram voice note)."""
+def _synth_mp3(text: str, lang: str) -> bytes:
+    """gTTS reads the text VERBATIM (sync; run via asyncio.to_thread)."""
+    from gtts import gTTS
+    buf = io.BytesIO()
+    gTTS(text=text, lang=lang).write_to_fp(buf)
+    return buf.getvalue()
+
+
+async def synth_speech(chat_id: int, text: str) -> bytes:
+    """Synthesize speech for `text` with a real TTS engine (verbatim). Returns MP3."""
+    return await asyncio.to_thread(_synth_mp3, text, pick_lang(text, chat_id))
+
+
+async def mp3_to_ogg(mp3: bytes) -> bytes | None:
+    """Transcode MP3 → OGG/Opus via ffmpeg (for a Telegram voice note)."""
     exe = _ffmpeg_exe()
     if not exe:
         return None
     proc = await asyncio.create_subprocess_exec(
-        exe, "-loglevel", "error",
-        "-f", "s16le", "-ar", str(TTS_SAMPLE_RATE), "-ac", "1", "-i", "pipe:0",
+        exe, "-loglevel", "error", "-f", "mp3", "-i", "pipe:0",
         "-c:a", "libopus", "-b:a", "32k", "-f", "ogg", "pipe:1",
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    out, err = await proc.communicate(pcm)
+    out, err = await proc.communicate(mp3)
     if proc.returncode != 0 or not out:
         logger.error("ffmpeg failed: %s", err[:300])
         return None
     return out
-
-
-def pcm_to_wav(pcm: bytes) -> bytes:
-    """Wrap raw PCM16 in a WAV container (no external deps)."""
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(TTS_SAMPLE_RATE)
-        w.writeframes(pcm)
-    return buf.getvalue()
 
 
 async def ask_voice(chat_id: int, user_id: int, user_text: str) -> str:
@@ -1137,24 +1080,21 @@ async def callback_set_model(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+_LANG_LABELS = {"auto": "🌐 Авто", "ru": "🇷🇺 Русский", "en": "🇬🇧 English"}
+
+
 def voice_keyboard(chat_id: int) -> InlineKeyboardMarkup:
-    current = get_voice(chat_id)
-    rows, row = [], []
-    for v in TTS_VOICES:
-        tick = "✅ " if v == current else ""
-        row.append(InlineKeyboardButton(f"{tick}{v}", callback_data=f"setvoice:{v}"))
-        if len(row) == 2:
-            rows.append(row); row = []
-    if row:
-        rows.append(row)
-    return InlineKeyboardMarkup(rows)
+    current = get_lang(chat_id)
+    row = [InlineKeyboardButton(("✅ " if v == current else "") + _LANG_LABELS[v],
+                                callback_data=f"setvoice:{v}") for v in TTS_LANGS]
+    return InlineKeyboardMarkup([row])
 
 
 async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     await update.message.reply_text(
-        f"Текущий голос: {get_voice(chat_id)}\n\nВыбери голос для /say "
-        "(послушать можно, отправив /say после выбора):",
+        f"Язык озвучки /say: {_LANG_LABELS[get_lang(chat_id)]}\n\n"
+        "«Авто» определяет язык по тексту ответа. Выбери:",
         reply_markup=voice_keyboard(chat_id),
     )
 
@@ -1164,10 +1104,11 @@ async def callback_set_voice(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     chat_id = query.message.chat_id
     v = query.data.split(":", 1)[1]
-    if v in TTS_VOICES:
+    if v in TTS_LANGS:
         chat_voice[chat_id] = v
         save_chat_state(chat_id)
-    await query.edit_message_text(f"🎙 Голос: {get_voice(chat_id)}", reply_markup=voice_keyboard(chat_id))
+    await query.edit_message_text(
+        f"🎙 Язык озвучки: {_LANG_LABELS[get_lang(chat_id)]}", reply_markup=voice_keyboard(chat_id))
 
 
 async def cmd_imgmodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1622,7 +1563,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/poll [тема] — шуточный опрос\n"
         "/predict, /tarot, /8ball — предсказания 🔮\n"
         "/say <текст> — отвечу голосом (можно reply на сообщение/фото) 🎙\n"
-        "/voice — выбрать голос\n"
+        "/voice — язык озвучки (авто/ru/en)\n"
         "/cursed — всратый режим 😈\n"
         "/chime — спонтанные вбросы в беседу 🗣\n"
         "/web — веб-поиск 🌐\n"
@@ -2064,17 +2005,18 @@ async def cmd_say(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             answer = await ask_voice(chat_id, user_id, q)
         answer = answer.strip() or "..."
 
-        pcm, spoken = await tts_pcm(chat_id, answer)
-        ogg = await pcm_to_ogg(pcm)
-        # Caption = what was actually voiced, so text and audio always match.
-        caption = strip_md(spoken or answer)[:1024]
+        # The TTS engine reads `answer` verbatim, so audio == caption by construction.
+        spoken = strip_md(answer)
+        mp3 = await synth_speech(chat_id, spoken)
+        ogg = await mp3_to_ogg(mp3)
+        caption = spoken[:1024]
         if ogg:
             bio = io.BytesIO(ogg)
             bio.name = "voice.ogg"
             await update.message.reply_voice(voice=bio, caption=caption)
         else:
-            bio = io.BytesIO(pcm_to_wav(pcm))
-            bio.name = "voice.wav"
+            bio = io.BytesIO(mp3)
+            bio.name = "voice.mp3"
             await update.message.reply_audio(audio=bio, caption=caption)
     except httpx.HTTPStatusError as e:
         detail = _openrouter_error_text(e.response)
@@ -2121,7 +2063,7 @@ async def _post_init(app) -> None:
         BotCommand("tarot",    "Расклад таро-шарлатана"),
         BotCommand("8ball",    "Магический шар"),
         BotCommand("say",      "Ответить голосом 🎙"),
-        BotCommand("voice",    "Выбрать голос для /say"),
+        BotCommand("voice",    "Язык озвучки /say"),
         BotCommand("cursed",   "Всратый режим вкл/выкл"),
         BotCommand("chime",    "Спонтанные вбросы вкл/выкл"),
         BotCommand("web",      "Веб-поиск вкл/выкл"),
