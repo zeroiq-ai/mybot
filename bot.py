@@ -160,6 +160,7 @@ _img_cooldown: dict[int, float]      = {}   # chat_id → last image-op timestam
 _grp_buffer:   dict[int, list[tuple[float, str]]] = defaultdict(list)  # recent group msgs
 _spont_last:   dict[int, float]      = {}   # chat_id → last spontaneous interjection ts
 chime_context: dict[int, list[str]]  = defaultdict(list)  # chat_id → bot's recent chime-ins
+recent_msgs:   dict[int, list[str]]  = defaultdict(list)  # chat_id → recent "name: text" log
 
 MAX_HISTORY    = 300
 MAX_TOKENS     = 1024
@@ -168,6 +169,9 @@ MAX_MEMORIES   = 30      # max remembered facts per user
 DOC_CHUNK      = 12000   # chars per chunk when summarizing long documents
 DOC_MAX_CHUNKS = 12      # cap chunks to bound cost on huge documents
 MAX_CHIME_NOTES = 20     # how many recent chime-ins to remember per chat
+RECENT_LOG_MAX  = 60     # recent chat messages kept for /scene
+SCENE_DEFAULT   = 15     # default number of messages for /scene
+SCENE_MAX       = 50     # max messages /scene will use
 
 # Spontaneous "chime-in": if a group sees >= SPONT_THRESHOLD messages within
 # SPONT_WINDOW seconds without the bot, it may drop an opinion — at most once
@@ -1075,6 +1079,66 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await status_msg.edit_text(f"⚠️ Что-то пошло не так: {e}")
 
 
+async def gen_scene_prompt(chat_id: int, transcript: str) -> str:
+    """Turn a chat excerpt into a vivid image-generation prompt."""
+    instruction = (
+        "На основе этого фрагмента переписки придумай одно яркое визуальное описание "
+        "сцены/иллюстрации, передающей суть и настроение обсуждения (можно с юмором). "
+        "Верни ТОЛЬКО промпт для генератора изображений на английском языке, одной строкой, "
+        "без пояснений и кавычек.\n\nПереписка:\n" + transcript)
+    return (await gen_text(instruction, max_tokens=200, temperature=0.9,
+                           chat_id=chat_id, kind="scene")).strip()
+
+
+async def cmd_scene(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate an image based on the last N chat messages."""
+    chat_id = update.effective_chat.id
+    n = SCENE_DEFAULT
+    if context.args:
+        try:
+            n = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("Использование: /scene [сколько последних сообщений]\nНапример: /scene 20")
+            return
+    n = max(3, min(n, SCENE_MAX))
+
+    log = recent_msgs.get(chat_id, [])
+    if len(log) < 3:
+        await update.message.reply_text("Пока мало сообщений для сцены — пообщайтесь немного и попробуй снова.")
+        return
+    excerpt = log[-n:]
+
+    rem = _cooldown_left(chat_id)
+    if rem > 0:
+        await update.message.reply_text(f"⏳ Подожди ещё {int(rem) + 1}с перед следующей картинкой.")
+        return
+    _mark_image(chat_id)
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
+    status = await update.message.reply_text(f"🖼 Рисую сцену по последним {len(excerpt)} сообщениям…")
+    try:
+        prompt = await gen_scene_prompt(chat_id, "\n".join(excerpt))
+        if not prompt:
+            await status.edit_text("⚠️ Не удалось придумать сцену. Попробуй ещё раз.")
+            return
+        model = get_image_model(chat_id)
+        out, cost = await generate_image(prompt, "16:9", model=model)
+        log_cost(chat_id, "image", cost)
+        last_gen[chat_id] = {"kind": "imagine", "prompt": prompt, "aspect": "16:9",
+                             "src": None, "model": model, "res": None}
+        await update.message.reply_photo(
+            photo=io.BytesIO(out), caption=f"🖼 Сцена по последним {len(excerpt)} сообщениям",
+            reply_markup=more_keyboard())
+        await status.delete()
+    except httpx.HTTPStatusError as e:
+        detail = _openrouter_error_text(e.response)
+        logger.error("Scene API error: %s — %s", e.response.status_code, detail)
+        await status.edit_text(f"⚠️ Ошибка (HTTP {e.response.status_code}): {detail}")
+    except Exception as e:
+        logger.exception("Scene error")
+        await status.edit_text(f"⚠️ Что-то пошло не так: {e}")
+
+
 async def send_long(message, text: str) -> None:
     """Send text in <=TG_MAX_LEN chunks (Telegram rejects longer messages)."""
     for i in range(0, len(text), TG_MAX_LEN):
@@ -1117,6 +1181,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id, user_id = _ids(update)
     _touch(chat_id)
     text = update.message.text
+    # Keep a rolling log of recent chat messages for /scene.
+    user = update.effective_user
+    name = (user.first_name or user.username or "кто-то") if user else "кто-то"
+    recent_msgs[chat_id].append(f"{name}: {text}")
+    recent_msgs[chat_id][:] = recent_msgs[chat_id][-RECENT_LOG_MAX:]
     # In groups, only respond when the bot is addressed (mention or reply).
     if _is_group(update):
         if not _addressed_to_bot(update, context):
@@ -1273,6 +1342,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/model — выбрать модель чата\n"
         "/imagine <промпт> [--ratio 16:9] [--res 2K] — сгенерировать картинку\n"
         "/imgmodel — выбрать модель картинок\n"
+        "/scene [N] — картинка по последним N сообщениям 🖼\n"
         "/cursed — всратый режим 😈\n"
         "/chime — спонтанные вбросы в беседу 🗣\n"
         "/web — веб-поиск 🌐\n"
@@ -1563,6 +1633,7 @@ async def _post_init(app) -> None:
         BotCommand("model",   "Выбрать модель"),
         BotCommand("imagine",  "Сгенерировать картинку"),
         BotCommand("imgmodel", "Модель картинок"),
+        BotCommand("scene",    "Картинка по последним сообщениям"),
         BotCommand("cursed",   "Всратый режим вкл/выкл"),
         BotCommand("chime",    "Спонтанные вбросы вкл/выкл"),
         BotCommand("web",      "Веб-поиск вкл/выкл"),
@@ -1592,6 +1663,7 @@ def main() -> None:
     app.add_handler(CommandHandler("info",     cmd_info))
     app.add_handler(CommandHandler("imagine",  cmd_imagine))
     app.add_handler(CommandHandler("imgmodel", cmd_imgmodel))
+    app.add_handler(CommandHandler("scene",    cmd_scene))
     app.add_handler(CommandHandler("cursed",   cmd_cursed))
     app.add_handler(CommandHandler("chime",    cmd_chime))
     app.add_handler(CommandHandler("stats",    cmd_stats))
