@@ -2,8 +2,10 @@ import os
 import io
 import json
 import time
+import wave
 import base64
 import random
+import shutil
 import sqlite3
 import asyncio
 import logging
@@ -755,11 +757,14 @@ def _delta_audio_data(delta) -> str | None:
     return audio.get("data") if isinstance(audio, dict) else getattr(audio, "data", None)
 
 
-async def tts_bytes(chat_id: int, text: str) -> bytes:
-    """Synthesize speech via an OpenRouter audio model. Returns OGG/Opus bytes.
+TTS_SAMPLE_RATE = 24000   # OpenAI audio output is 24kHz mono 16-bit PCM
 
-    Audio-output models on OpenRouter require streaming, so we collect the
-    base64 audio fragments from the stream and decode the concatenation."""
+
+async def tts_pcm(chat_id: int, text: str) -> bytes:
+    """Synthesize speech via an OpenRouter audio model. Returns raw PCM16 bytes.
+
+    Audio output requires streaming, and with stream=true the only supported
+    format is pcm16, so we collect the base64 fragments and decode them."""
     stream = await with_retry(lambda: client.chat.completions.create(
         model=TTS_MODEL,
         messages=[{"role": "user", "content": text}],
@@ -768,7 +773,7 @@ async def tts_bytes(chat_id: int, text: str) -> bytes:
         extra_headers={"X-Title": "Telegram Claude Bot"},
         extra_body={
             "modalities": ["text", "audio"],
-            "audio": {"voice": TTS_VOICE, "format": "opus"},
+            "audio": {"voice": TTS_VOICE, "format": "pcm16"},
             "usage": {"include": True},
         },
     ))
@@ -784,6 +789,35 @@ async def tts_bytes(chat_id: int, text: str) -> bytes:
     if not b64:
         raise ValueError("No audio in TTS stream")
     return base64.b64decode(b64)
+
+
+async def pcm_to_ogg(pcm: bytes) -> bytes | None:
+    """Encode raw PCM16 to OGG/Opus via ffmpeg (for a Telegram voice note)."""
+    if not shutil.which("ffmpeg"):
+        return None
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-loglevel", "error",
+        "-f", "s16le", "-ar", str(TTS_SAMPLE_RATE), "-ac", "1", "-i", "pipe:0",
+        "-c:a", "libopus", "-b:a", "32k", "-f", "ogg", "pipe:1",
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate(pcm)
+    if proc.returncode != 0 or not out:
+        logger.error("ffmpeg failed: %s", err[:300])
+        return None
+    return out
+
+
+def pcm_to_wav(pcm: bytes) -> bytes:
+    """Wrap raw PCM16 in a WAV container (no external deps)."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(TTS_SAMPLE_RATE)
+        w.writeframes(pcm)
+    return buf.getvalue()
 
 
 async def gen_opinion(chat_id: int, transcript: str) -> str:
@@ -1833,13 +1867,15 @@ async def cmd_say(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Ответь кратко и разговорно, как для зачитывания вслух: 1–3 предложения, "
             "без разметки и эмодзи.", text, chat_id, "chat", max_tokens=200, temperature=0.7)
         ).strip() or text
-        audio = await tts_bytes(chat_id, answer)
-        bio = io.BytesIO(audio)
-        bio.name = "voice.ogg"
-        try:
+        pcm = await tts_pcm(chat_id, answer)
+        ogg = await pcm_to_ogg(pcm)
+        if ogg:
+            bio = io.BytesIO(ogg)
+            bio.name = "voice.ogg"
             await update.message.reply_voice(voice=bio, caption=answer[:1024])
-        except Exception:
-            bio.seek(0)
+        else:
+            bio = io.BytesIO(pcm_to_wav(pcm))
+            bio.name = "voice.wav"
             await update.message.reply_audio(audio=bio, caption=answer[:1024])
     except httpx.HTTPStatusError as e:
         detail = _openrouter_error_text(e.response)

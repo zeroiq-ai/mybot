@@ -1,0 +1,3 @@
+# Install ffmpeg so the bot can encode TTS audio (PCM16 → OGG/Opus voice notes).
+[phases.setup]
+aptPkgs = ["ffmpeg"]
