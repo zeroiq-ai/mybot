@@ -60,6 +60,19 @@ def test_chime_note_persists_and_caps():
     assert rows == bot.MAX_CHIME_NOTES
 
 
+def test_md_to_html():
+    assert bot.md_to_html("**жирный**") == "<b>жирный</b>"
+    assert bot.md_to_html("`code`") == "<code>code</code>"
+    assert "<b>Заголовок</b>" in bot.md_to_html("## Заголовок")
+    # HTML-special chars are escaped
+    assert "&lt;" in bot.md_to_html("a < b")
+
+
+def test_strip_md():
+    assert bot.strip_md("**жирный** и `код`") == "жирный и код"
+    assert bot.strip_md("# Title") == "Title"
+
+
 def test_defaults():
     assert bot.get_cursed(999) is True       # cursed default ON
     assert bot.get_web(999) is False         # web default OFF

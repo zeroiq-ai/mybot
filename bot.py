@@ -1,6 +1,8 @@
 import os
 import io
+import re
 import json
+import html
 import time
 import wave
 import base64
@@ -668,13 +670,20 @@ async def stream_reply(update: Update, chat_id: int, user_id: int, user_text: st
     if not acc:
         acc = "⚠️ Модель вернула пустой ответ. Попробуй переформулировать."
 
-    # Final render (split if longer than one Telegram message).
-    try:
-        await placeholder.edit_text(acc[:TG_MAX_LEN])
-    except Exception:
-        pass
-    for i in range(TG_MAX_LEN, len(acc), TG_MAX_LEN):
-        await update.message.reply_text(acc[i:i + TG_MAX_LEN])
+    # Final render: try rendered HTML (Markdown → formatting), else plain text.
+    rendered = md_to_html(acc)
+    done = False
+    if len(rendered) <= TG_MAX_LEN:
+        try:
+            await placeholder.edit_text(rendered, parse_mode="HTML")
+            done = True
+        except Exception:
+            pass
+    if not done:
+        plain = strip_md(acc)
+        await placeholder.edit_text(plain[:TG_MAX_LEN])
+        for i in range(TG_MAX_LEN, len(plain), TG_MAX_LEN):
+            await update.message.reply_text(plain[i:i + TG_MAX_LEN])
 
     conversations[key].append({"role": "assistant", "content": acc})
     save_message(chat_id, user_id, "assistant", acc)
@@ -1338,10 +1347,50 @@ async def cmd_scene(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await status.edit_text(f"⚠️ Что-то пошло не так: {e}")
 
 
-async def send_long(message, text: str) -> None:
-    """Send text in <=TG_MAX_LEN chunks (Telegram rejects longer messages)."""
-    for i in range(0, len(text), TG_MAX_LEN):
-        await message.reply_text(text[i:i + TG_MAX_LEN])
+def md_to_html(text: str) -> str:
+    """Convert the common Markdown the models emit into Telegram-safe HTML."""
+    text = html.escape(text)
+    # fenced code blocks ```...```
+    text = re.sub(r"```[^\n]*\n?(.*?)```", lambda m: f"<pre>{m.group(1)}</pre>", text, flags=re.S)
+    # inline code `code`
+    text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
+    # bold **text** / __text__
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.S)
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text, flags=re.S)
+    # markdown links [text](url)
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", r'<a href="\2">\1</a>', text)
+    # headings (#, ##, …) → bold line
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*(.+?)\s*$", r"<b>\1</b>", text)
+    # italic *text* / _text_ (avoid touching the bold tags already inserted)
+    text = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"<i>\1</i>", text)
+    text = re.sub(r"(?<![\w_])_([^_\n]+)_(?![\w_])", r"<i>\1</i>", text)
+    return text
+
+
+def strip_md(text: str) -> str:
+    """Remove the common Markdown markers for a clean plain-text fallback."""
+    text = re.sub(r"```[^\n]*\n?(.*?)```", r"\1", text, flags=re.S)
+    text = re.sub(r"[*_`]+", "", text)
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)
+    return text
+
+
+async def send_md(message, text: str) -> None:
+    """Send model output as HTML (rendered Markdown); fall back to clean plain text."""
+    rendered = md_to_html(text)
+    if len(rendered) <= TG_MAX_LEN:
+        try:
+            await message.reply_text(rendered, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+    plain = strip_md(text)
+    for i in range(0, len(plain), TG_MAX_LEN):
+        await message.reply_text(plain[i:i + TG_MAX_LEN])
+
+
+# Backwards-compatible alias used across handlers.
+send_long = send_md
 
 
 async def _maybe_chime_in(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -1849,7 +1898,7 @@ async def cmd_roast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         roast = (await gen_chat(ROAST_PROMPT, f"Цель роаста: {target}.\n{ctx}",
                                 chat_id, "roast", max_tokens=300, temperature=1.0)).strip()
-        await msg.reply_text(roast or "Даже шутить не о чем 🙃")
+        await send_md(msg, roast or "Даже шутить не о чем 🙃")
     except Exception as e:
         logger.exception("Roast error")
         await msg.reply_text(f"⚠️ Не вышло: {e}")
@@ -1891,7 +1940,7 @@ async def cmd_8ball(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
               "(1–2 фразы) саркастичный, но смешной ответ на вопрос. Лёгкий мат ок.")
     try:
         ans = await gen_chat(system, q, chat_id, "fortune", max_tokens=120, temperature=1.1)
-        await update.message.reply_text("🎱 " + ans.strip())
+        await send_md(update.message, "🎱 " + ans.strip())
     except Exception as e:
         logger.exception("8ball error")
         await update.message.reply_text(f"⚠️ Шар треснул: {e}")
@@ -1913,7 +1962,7 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         ans = await gen_chat(system, f"Предскажи сегодняшний день для: {target}",
                              chat_id, "fortune", max_tokens=160, temperature=1.1)
-        await msg.reply_text("🔮 " + ans.strip())
+        await send_md(msg, "🔮 " + ans.strip())
     except Exception as e:
         logger.exception("Predict error")
         await msg.reply_text(f"⚠️ Будущее размыто: {e}")
@@ -1927,7 +1976,7 @@ async def cmd_tarot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         ans = await gen_chat(system, "Сделай расклад на сегодня.",
                              chat_id, "fortune", max_tokens=300, temperature=1.1)
-        await update.message.reply_text("🃏 " + ans.strip())
+        await send_md(update.message, "🃏 " + ans.strip())
     except Exception as e:
         logger.exception("Tarot error")
         await update.message.reply_text(f"⚠️ Карты рассыпались: {e}")
@@ -1991,14 +2040,15 @@ async def cmd_say(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         pcm = await tts_pcm(chat_id, answer)
         ogg = await pcm_to_ogg(pcm)
+        caption = strip_md(answer)[:1024]
         if ogg:
             bio = io.BytesIO(ogg)
             bio.name = "voice.ogg"
-            await update.message.reply_voice(voice=bio, caption=answer[:1024])
+            await update.message.reply_voice(voice=bio, caption=caption)
         else:
             bio = io.BytesIO(pcm_to_wav(pcm))
             bio.name = "voice.wav"
-            await update.message.reply_audio(audio=bio, caption=answer[:1024])
+            await update.message.reply_audio(audio=bio, caption=caption)
     except httpx.HTTPStatusError as e:
         detail = _openrouter_error_text(e.response)
         logger.error("TTS API error: %s — %s", e.response.status_code, detail)
