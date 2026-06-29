@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import time
 import base64
 import random
@@ -81,6 +82,10 @@ DEFAULT_CHAT_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet
 # Multimodal model used for image understanding and voice transcription
 # (must accept image + audio input). Gemini Flash handles both cheaply.
 AUX_MODEL = os.environ.get("OPENROUTER_AUX_MODEL", "google/gemini-2.5-flash")
+
+# Text-to-speech (audio-output) model + voice for /say.
+TTS_MODEL = os.environ.get("OPENROUTER_TTS_MODEL", "openai/gpt-audio-mini")
+TTS_VOICE = os.environ.get("OPENROUTER_TTS_VOICE", "ash")
 
 # Telegram hard limit for a single text message.
 TG_MAX_LEN = 4096
@@ -723,6 +728,46 @@ async def gen_text(prompt: str, max_tokens: int = 300, temperature: float = 1.1,
     return response.choices[0].message.content or ""
 
 
+async def gen_chat(system: str, user_content: str, chat_id: int | None = None,
+                   kind: str = "gen", max_tokens: int = 300, temperature: float = 0.9) -> str:
+    """One-off system+user generation (no history)."""
+    response = await with_retry(lambda: client.chat.completions.create(
+        model=AUX_MODEL,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": user_content}],
+        extra_headers={"X-Title": "Telegram Claude Bot"},
+        extra_body={"usage": {"include": True}},
+    ))
+    if chat_id is not None:
+        log_cost(chat_id, kind, _cost_from_response(response))
+    return response.choices[0].message.content or ""
+
+
+async def tts_bytes(chat_id: int, text: str) -> bytes:
+    """Synthesize speech via an OpenRouter audio model. Returns OGG/Opus bytes."""
+    response = await with_retry(lambda: client.chat.completions.create(
+        model=TTS_MODEL,
+        messages=[{"role": "user", "content": text}],
+        extra_headers={"X-Title": "Telegram Claude Bot"},
+        extra_body={
+            "modalities": ["text", "audio"],
+            "audio": {"voice": TTS_VOICE, "format": "opus"},
+            "usage": {"include": True},
+        },
+    ))
+    log_cost(chat_id, "tts", _cost_from_response(response))
+    msg = response.choices[0].message
+    audio = getattr(msg, "audio", None)
+    if audio is None and getattr(msg, "model_extra", None):
+        audio = msg.model_extra.get("audio")
+    data = audio.get("data") if isinstance(audio, dict) else getattr(audio, "data", None)
+    if not data:
+        raise ValueError("No audio in TTS response")
+    return base64.b64decode(data)
+
+
 async def gen_opinion(chat_id: int, transcript: str) -> str:
     """Generate a spontaneous in-character opinion about the recent chat."""
     response = await with_retry(lambda: client.chat.completions.create(
@@ -1343,6 +1388,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/imagine <промпт> [--ratio 16:9] [--res 2K] — сгенерировать картинку\n"
         "/imgmodel — выбрать модель картинок\n"
         "/scene [N] — картинка по последним N сообщениям 🖼\n"
+        "/roast [@кто|reply] — поджарить участника 🔥\n"
+        "/summary [N] — саркастичные итоги чата\n"
+        "/poll [тема] — шуточный опрос\n"
+        "/predict, /tarot, /8ball — предсказания 🔮\n"
+        "/say <текст> — отвечу голосом 🎙\n"
         "/cursed — всратый режим 😈\n"
         "/chime — спонтанные вбросы в беседу 🗣\n"
         "/web — веб-поиск 🌐\n"
@@ -1605,6 +1655,183 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await msg.reply_text(f"⚠️ Не получилось обработать документ: {e}")
 
 
+def _recent_by_name(chat_id: int, name: str, limit: int = 15) -> list[str]:
+    pref = f"{name}:".lower()
+    lines = [l for l in recent_msgs.get(chat_id, []) if l.lower().startswith(pref)]
+    return lines[-limit:]
+
+
+ROAST_PROMPT = (
+    "Ты — мастер дружеского роаста в групповом чате. Поджарь участника остроумно, едко, "
+    "с чёрным юмором и сарказмом; лёгкий мат допустим. Это ДРУЖЕСКАЯ шутка: без реальной "
+    "жестокости и угроз, без тем расы, религии, пола, ориентации, инвалидности, здоровья и "
+    "внешности как травли, без сексуализации. Опирайся на сообщения человека, если они есть. "
+    "2–4 предложения, только текст роаста."
+)
+
+
+async def cmd_roast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    msg = update.message
+    sample: list[str] = []
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        u = msg.reply_to_message.from_user
+        target = u.first_name or u.username or "этот тип"
+        if msg.reply_to_message.text:
+            sample.append(f"{target}: {msg.reply_to_message.text}")
+        sample += _recent_by_name(chat_id, target)
+    elif context.args:
+        target = " ".join(context.args).lstrip("@")
+        sample = _recent_by_name(chat_id, target)
+    else:
+        u = update.effective_user
+        target = (u.first_name or u.username or "ты") if u else "ты"
+        sample = _recent_by_name(chat_id, target)
+
+    ctx = ("Сообщения цели:\n" + "\n".join(sample)) if sample else \
+        "Сообщений нет — импровизируй по имени."
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    try:
+        roast = (await gen_chat(ROAST_PROMPT, f"Цель роаста: {target}.\n{ctx}",
+                                chat_id, "roast", max_tokens=300, temperature=1.0)).strip()
+        await msg.reply_text(roast or "Даже шутить не о чем 🙃")
+    except Exception as e:
+        logger.exception("Roast error")
+        await msg.reply_text(f"⚠️ Не вышло: {e}")
+
+
+async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    n = 30
+    if context.args:
+        try:
+            n = int(context.args[0])
+        except ValueError:
+            pass
+    n = max(5, min(n, RECENT_LOG_MAX))
+    log = recent_msgs.get(chat_id, [])
+    if len(log) < 5:
+        await update.message.reply_text("Мало сообщений для итогов. Пообщайтесь ещё.")
+        return
+    system = ("Ты — саркастичный комментатор чата. Сделай смешное едкое саммари обсуждения, "
+              "обращайся к участникам как 'кожаные мешки', чёрный юмор и лёгкий мат ок, "
+              "без травли конкретных людей. 3–6 предложений.")
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    try:
+        s = await gen_chat(system, "Сообщения:\n" + "\n".join(log[-n:]),
+                           chat_id, "summary", max_tokens=500, temperature=0.9)
+        await send_long(update.message, s or "Нечего подытожить.")
+    except Exception as e:
+        logger.exception("Summary error")
+        await update.message.reply_text(f"⚠️ Не вышло: {e}")
+
+
+async def cmd_8ball(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    q = " ".join(context.args).strip()
+    if not q:
+        await update.message.reply_text("Использование: /8ball <вопрос>\nНапример: /8ball повезёт ли мне сегодня?")
+        return
+    system = ("Ты — абсурдный магический шар-предсказатель с чёрным юмором. Дай короткий "
+              "(1–2 фразы) саркастичный, но смешной ответ на вопрос. Лёгкий мат ок.")
+    try:
+        ans = await gen_chat(system, q, chat_id, "fortune", max_tokens=120, temperature=1.1)
+        await update.message.reply_text("🎱 " + ans.strip())
+    except Exception as e:
+        logger.exception("8ball error")
+        await update.message.reply_text(f"⚠️ Шар треснул: {e}")
+
+
+async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    msg = update.message
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        u = msg.reply_to_message.from_user
+        target = u.first_name or u.username or "тебя"
+    elif context.args:
+        target = " ".join(context.args).lstrip("@")
+    else:
+        u = update.effective_user
+        target = (u.first_name or u.username or "тебя") if u else "тебя"
+    system = ("Ты выдаёшь абсурдные шуточные предсказания на день с чёрным юмором и сарказмом. "
+              "1–3 предложения, конкретно и нелепо.")
+    try:
+        ans = await gen_chat(system, f"Предскажи сегодняшний день для: {target}",
+                             chat_id, "fortune", max_tokens=160, temperature=1.1)
+        await msg.reply_text("🔮 " + ans.strip())
+    except Exception as e:
+        logger.exception("Predict error")
+        await msg.reply_text(f"⚠️ Будущее размыто: {e}")
+
+
+async def cmd_tarot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    system = ("Ты — таролог-шарлатан. Вытяни 3 ВЫДУМАННЫЕ абсурдные карты и дай ехидное "
+              "шуточное толкование на сегодня. Назови карты и дай расклад, 3–5 предложений, "
+              "чёрный юмор приветствуется.")
+    try:
+        ans = await gen_chat(system, "Сделай расклад на сегодня.",
+                             chat_id, "fortune", max_tokens=300, temperature=1.1)
+        await update.message.reply_text("🃏 " + ans.strip())
+    except Exception as e:
+        logger.exception("Tarot error")
+        await update.message.reply_text(f"⚠️ Карты рассыпались: {e}")
+
+
+async def cmd_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    topic = " ".join(context.args).strip()
+    basis = topic or "\n".join(recent_msgs.get(chat_id, [])[-20:])
+    if not basis:
+        await update.message.reply_text("Использование: /poll <тема> — или просто пообщайтесь, и я возьму тему из чата.")
+        return
+    system = ('Придумай ОДИН шуточный опрос по теме. Верни СТРОГО JSON без обрамления: '
+              '{"question": "...", "options": ["...", "..."]}. 2–4 варианта, вопрос до 250 '
+              'символов, вариант до 90 символов, с юмором и сарказмом.')
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    try:
+        raw = await gen_chat(system, basis, chat_id, "poll", max_tokens=300, temperature=1.0)
+        start, end = raw.find("{"), raw.rfind("}")
+        data = json.loads(raw[start:end + 1])
+        question = str(data["question"])[:250]
+        options = [str(o)[:90] for o in data["options"] if str(o).strip()][:10]
+        if len(options) < 2:
+            raise ValueError("not enough options")
+        await context.bot.send_poll(chat_id, question, options, is_anonymous=False)
+    except Exception as e:
+        logger.exception("Poll error")
+        await update.message.reply_text(f"⚠️ Опрос не сложился: {e}")
+
+
+async def cmd_say(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text("Использование: /say <текст или вопрос> — отвечу голосом 🎙")
+        return
+    await context.bot.send_chat_action(chat_id=chat_id, action="record_voice")
+    try:
+        answer = (await gen_chat(
+            "Ответь кратко и разговорно, как для зачитывания вслух: 1–3 предложения, "
+            "без разметки и эмодзи.", text, chat_id, "chat", max_tokens=200, temperature=0.7)
+        ).strip() or text
+        audio = await tts_bytes(chat_id, answer)
+        bio = io.BytesIO(audio)
+        bio.name = "voice.ogg"
+        try:
+            await update.message.reply_voice(voice=bio, caption=answer[:1024])
+        except Exception:
+            bio.seek(0)
+            await update.message.reply_audio(audio=bio, caption=answer[:1024])
+    except httpx.HTTPStatusError as e:
+        detail = _openrouter_error_text(e.response)
+        logger.error("TTS API error: %s — %s", e.response.status_code, detail)
+        await update.message.reply_text(f"⚠️ Голос не вышел (HTTP {e.response.status_code}): {detail}")
+    except Exception as e:
+        logger.exception("Say error")
+        await update.message.reply_text(f"⚠️ Голос не вышел: {e}")
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log any uncaught handler exception instead of failing silently."""
     logger.error("Unhandled exception", exc_info=context.error)
@@ -1634,6 +1861,13 @@ async def _post_init(app) -> None:
         BotCommand("imagine",  "Сгенерировать картинку"),
         BotCommand("imgmodel", "Модель картинок"),
         BotCommand("scene",    "Картинка по последним сообщениям"),
+        BotCommand("roast",    "Поджарить участника 🔥"),
+        BotCommand("summary",  "Саркастичные итоги чата"),
+        BotCommand("poll",     "Шуточный опрос по теме"),
+        BotCommand("predict",  "Абсурдное предсказание"),
+        BotCommand("tarot",    "Расклад таро-шарлатана"),
+        BotCommand("8ball",    "Магический шар"),
+        BotCommand("say",      "Ответить голосом 🎙"),
         BotCommand("cursed",   "Всратый режим вкл/выкл"),
         BotCommand("chime",    "Спонтанные вбросы вкл/выкл"),
         BotCommand("web",      "Веб-поиск вкл/выкл"),
@@ -1664,6 +1898,13 @@ def main() -> None:
     app.add_handler(CommandHandler("imagine",  cmd_imagine))
     app.add_handler(CommandHandler("imgmodel", cmd_imgmodel))
     app.add_handler(CommandHandler("scene",    cmd_scene))
+    app.add_handler(CommandHandler("roast",    cmd_roast))
+    app.add_handler(CommandHandler("summary",  cmd_summary))
+    app.add_handler(CommandHandler("8ball",    cmd_8ball))
+    app.add_handler(CommandHandler("predict",  cmd_predict))
+    app.add_handler(CommandHandler("tarot",    cmd_tarot))
+    app.add_handler(CommandHandler("poll",     cmd_poll))
+    app.add_handler(CommandHandler("say",      cmd_say))
     app.add_handler(CommandHandler("cursed",   cmd_cursed))
     app.add_handler(CommandHandler("chime",    cmd_chime))
     app.add_handler(CommandHandler("stats",    cmd_stats))
