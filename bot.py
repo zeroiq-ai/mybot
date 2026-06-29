@@ -85,9 +85,10 @@ DEFAULT_CHAT_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet
 # (must accept image + audio input). Gemini Flash handles both cheaply.
 AUX_MODEL = os.environ.get("OPENROUTER_AUX_MODEL", "google/gemini-2.5-flash")
 
-# Text-to-speech (audio-output) model + voice for /say.
+# Text-to-speech (audio-output) model + default voice for /say.
 TTS_MODEL = os.environ.get("OPENROUTER_TTS_MODEL", "openai/gpt-audio-mini")
 TTS_VOICE = os.environ.get("OPENROUTER_TTS_VOICE", "ash")
+TTS_VOICES = ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"]
 
 # Telegram hard limit for a single text message.
 TG_MAX_LEN = 4096
@@ -155,6 +156,7 @@ MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 conversations: dict[tuple[int, int], list[dict]] = defaultdict(list)
 user_model:    dict[int, str]        = {}   # chat_id → model id
 image_model:   dict[int, str]        = {}   # chat_id → image model id
+chat_voice:    dict[int, str]        = {}   # chat_id → TTS voice
 cursed_mode:   dict[int, bool]       = {}   # chat_id → auto "cursed" remix (default ON)
 last_active:   dict[int, float]      = {}   # chat_id → epoch seconds of last activity
 morning_mode:  dict[int, bool]       = {}   # chat_id → daily greeting on/off (default ON)
@@ -261,14 +263,15 @@ def db_init() -> None:
         _add_column("chat_state", "web", "INTEGER")
         _add_column("chat_state", "img_model", "TEXT")
         _add_column("chat_state", "spontan", "INTEGER")
+        _add_column("chat_state", "voice", "TEXT")
         _add_column("messages", "user_id", "INTEGER")
         _add_column("memories", "user_id", "INTEGER")
         _db.execute("CREATE INDEX IF NOT EXISTS idx_messages_key ON messages(chat_id, user_id, id)")
         _db.execute("CREATE INDEX IF NOT EXISTS idx_mem_user ON memories(user_id, id)")
         _db.commit()
 
-        for chat_id, model, cursed, la, morning, web, imgm, spontan in _db.execute(
-            "SELECT chat_id, model, cursed, last_active, morning, web, img_model, spontan "
+        for chat_id, model, cursed, la, morning, web, imgm, spontan, voice in _db.execute(
+            "SELECT chat_id, model, cursed, last_active, morning, web, img_model, spontan, voice "
             "FROM chat_state"
         ):
             if model:
@@ -285,6 +288,8 @@ def db_init() -> None:
                 image_model[chat_id] = imgm
             if spontan is not None:
                 spontan_mode[chat_id] = bool(spontan)
+            if voice:
+                chat_voice[chat_id] = voice
         # Old rows have NULL user_id; private chats have chat_id == user_id, so
         # coalescing NULL→chat_id keeps legacy history reachable.
         for chat_id, user_id, role, content in _db.execute(
@@ -312,16 +317,17 @@ def save_chat_state(chat_id: int) -> None:
     with _db_lock:
         _db.execute(
             "INSERT INTO chat_state"
-            "(chat_id, model, cursed, last_active, morning, web, img_model, spontan) "
-            "VALUES(?,?,?,?,?,?,?,?) "
+            "(chat_id, model, cursed, last_active, morning, web, img_model, spontan, voice) "
+            "VALUES(?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(chat_id) DO UPDATE SET "
             "model=excluded.model, cursed=excluded.cursed, last_active=excluded.last_active, "
             "morning=excluded.morning, web=excluded.web, img_model=excluded.img_model, "
-            "spontan=excluded.spontan",
+            "spontan=excluded.spontan, voice=excluded.voice",
             (chat_id, user_model.get(chat_id),
              1 if get_cursed(chat_id) else 0, last_active.get(chat_id),
              1 if get_morning(chat_id) else 0, 1 if get_web(chat_id) else 0,
-             image_model.get(chat_id), 1 if get_chime(chat_id) else 0),
+             image_model.get(chat_id), 1 if get_chime(chat_id) else 0,
+             chat_voice.get(chat_id)),
         )
         _db.commit()
 
@@ -433,6 +439,25 @@ def get_automem(user_id: int) -> bool:
 
 def get_chime(chat_id: int) -> bool:
     return spontan_mode.get(chat_id, True)
+
+
+def get_voice(chat_id: int) -> str:
+    return chat_voice.get(chat_id, TTS_VOICE)
+
+
+def build_voice_system(user_id: int, chat_id: int | None = None) -> str:
+    """In-character system prompt for spoken (/say) replies."""
+    parts = [PERSONALITY_PROMPT +
+             " Это ГОЛОСОВОЙ ответ: пиши живым разговорным текстом для зачитывания вслух, "
+             "без разметки, списков и эмодзи, 1–4 предложения."]
+    facts = memories.get(user_id)
+    if facts:
+        parts.append("Запомненные факты о пользователе:\n" + "\n".join(f"- {f}" for f in facts))
+    notes = chime_context.get(chat_id) if chat_id is not None else None
+    if notes:
+        parts.append("Ранее в этом чате ты высказывал такие мнения:\n" +
+                     "\n".join(f"- {n}" for n in notes))
+    return "\n\n".join(parts)
 
 
 def get_image_model(chat_id: int) -> str:
@@ -773,7 +798,7 @@ async def tts_pcm(chat_id: int, text: str) -> bytes:
         extra_headers={"X-Title": "Telegram Claude Bot"},
         extra_body={
             "modalities": ["text", "audio"],
-            "audio": {"voice": TTS_VOICE, "format": "pcm16"},
+            "audio": {"voice": get_voice(chat_id), "format": "pcm16"},
             "usage": {"include": True},
         },
     ))
@@ -818,6 +843,42 @@ def pcm_to_wav(pcm: bytes) -> bytes:
         w.setframerate(TTS_SAMPLE_RATE)
         w.writeframes(pcm)
     return buf.getvalue()
+
+
+async def ask_voice(chat_id: int, user_id: int, user_text: str) -> str:
+    """Context-aware, in-character reply for /say (uses + updates history)."""
+    key = (chat_id, user_id)
+    conversations[key].append({"role": "user", "content": user_text})
+    trim_history(key)
+    save_message(chat_id, user_id, "user", user_text)
+
+    messages = [{"role": "system", "content": build_voice_system(user_id, chat_id)}] + conversations[key]
+    response = await with_retry(lambda: client.chat.completions.create(
+        model=chat_model_id(chat_id),
+        max_tokens=400,
+        messages=messages,
+        extra_headers={"X-Title": "Telegram Claude Bot"},
+        extra_body={"usage": {"include": True}},
+    ))
+    reply = response.choices[0].message.content or "..."
+    conversations[key].append({"role": "assistant", "content": reply})
+    save_message(chat_id, user_id, "assistant", reply)
+    log_cost(chat_id, "chat", _cost_from_response(response))
+    return reply
+
+
+async def gen_vision(system: str, parts: list[dict], chat_id: int) -> str:
+    """One-off multimodal generation with a system prompt (for /say on a photo)."""
+    response = await with_retry(lambda: client.chat.completions.create(
+        model=AUX_MODEL,
+        max_tokens=400,
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": parts}],
+        extra_headers={"X-Title": "Telegram Claude Bot"},
+        extra_body={"usage": {"include": True}},
+    ))
+    log_cost(chat_id, "vision", _cost_from_response(response))
+    return response.choices[0].message.content or "..."
 
 
 async def gen_opinion(chat_id: int, transcript: str) -> str:
@@ -1031,6 +1092,39 @@ async def callback_set_model(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"✅ Модель переключена на {label}\nИстория очищена.",
         reply_markup=model_keyboard(chat_id),
     )
+
+
+def voice_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    current = get_voice(chat_id)
+    rows, row = [], []
+    for v in TTS_VOICES:
+        tick = "✅ " if v == current else ""
+        row.append(InlineKeyboardButton(f"{tick}{v}", callback_data=f"setvoice:{v}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(
+        f"Текущий голос: {get_voice(chat_id)}\n\nВыбери голос для /say "
+        "(послушать можно, отправив /say после выбора):",
+        reply_markup=voice_keyboard(chat_id),
+    )
+
+
+async def callback_set_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    v = query.data.split(":", 1)[1]
+    if v in TTS_VOICES:
+        chat_voice[chat_id] = v
+        save_chat_state(chat_id)
+    await query.edit_message_text(f"🎙 Голос: {get_voice(chat_id)}", reply_markup=voice_keyboard(chat_id))
 
 
 async def cmd_imgmodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1444,7 +1538,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/summary [N] — саркастичные итоги чата\n"
         "/poll [тема] — шуточный опрос\n"
         "/predict, /tarot, /8ball — предсказания 🔮\n"
-        "/say <текст> — отвечу голосом 🎙\n"
+        "/say <текст> — отвечу голосом (можно reply на сообщение/фото) 🎙\n"
+        "/voice — выбрать голос\n"
         "/cursed — всратый режим 😈\n"
         "/chime — спонтанные вбросы в беседу 🗣\n"
         "/web — веб-поиск 🌐\n"
@@ -1856,17 +1951,36 @@ async def cmd_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_say(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
+    chat_id, user_id = _ids(update)
+    msg = update.message
     text = " ".join(context.args).strip()
-    if not text:
-        await update.message.reply_text("Использование: /say <текст или вопрос> — отвечу голосом 🎙")
+    reply = msg.reply_to_message
+    reply_text = (reply.text or reply.caption) if reply else None
+    reply_photo = reply.photo[-1] if (reply and reply.photo) else None
+
+    if not text and not reply:
+        await update.message.reply_text(
+            "Использование: /say <текст или вопрос> — отвечу голосом 🎙\n"
+            "Можно ответить (reply) на сообщение или фото — учту их.")
         return
+    if not text:
+        text = "Прокомментируй это."
+
     await context.bot.send_chat_action(chat_id=chat_id, action="record_voice")
     try:
-        answer = (await gen_chat(
-            "Ответь кратко и разговорно, как для зачитывания вслух: 1–3 предложения, "
-            "без разметки и эмодзи.", text, chat_id, "chat", max_tokens=200, temperature=0.7)
-        ).strip() or text
+        if reply_photo:
+            raw = await download_tg_file(context, reply_photo.file_id)
+            prompt = text + (f"\n(подпись к фото: {reply_text})" if reply_text else "")
+            answer = await gen_vision(
+                build_voice_system(user_id, chat_id),
+                [{"type": "text", "text": prompt},
+                 {"type": "image_url", "image_url": {"url": _data_url(raw, "image/jpeg")}}],
+                chat_id)
+        else:
+            q = text if not reply_text else f"{text}\n(в ответ на сообщение: «{reply_text}»)"
+            answer = await ask_voice(chat_id, user_id, q)
+        answer = answer.strip() or "..."
+
         pcm = await tts_pcm(chat_id, answer)
         ogg = await pcm_to_ogg(pcm)
         if ogg:
@@ -1922,6 +2036,7 @@ async def _post_init(app) -> None:
         BotCommand("tarot",    "Расклад таро-шарлатана"),
         BotCommand("8ball",    "Магический шар"),
         BotCommand("say",      "Ответить голосом 🎙"),
+        BotCommand("voice",    "Выбрать голос для /say"),
         BotCommand("cursed",   "Всратый режим вкл/выкл"),
         BotCommand("chime",    "Спонтанные вбросы вкл/выкл"),
         BotCommand("web",      "Веб-поиск вкл/выкл"),
@@ -1959,6 +2074,7 @@ def main() -> None:
     app.add_handler(CommandHandler("tarot",    cmd_tarot))
     app.add_handler(CommandHandler("poll",     cmd_poll))
     app.add_handler(CommandHandler("say",      cmd_say))
+    app.add_handler(CommandHandler("voice",    cmd_voice))
     app.add_handler(CommandHandler("cursed",   cmd_cursed))
     app.add_handler(CommandHandler("chime",    cmd_chime))
     app.add_handler(CommandHandler("stats",    cmd_stats))
@@ -1970,6 +2086,7 @@ def main() -> None:
     app.add_handler(CommandHandler("automem",  cmd_automem))
     app.add_handler(CallbackQueryHandler(callback_set_model, pattern=r"^setmodel:"))
     app.add_handler(CallbackQueryHandler(callback_set_img, pattern=r"^setimg:"))
+    app.add_handler(CallbackQueryHandler(callback_set_voice, pattern=r"^setvoice:"))
     app.add_handler(CallbackQueryHandler(callback_cursed, pattern=r"^cursed:"))
     app.add_handler(CallbackQueryHandler(callback_morning, pattern=r"^morning:"))
     app.add_handler(CallbackQueryHandler(callback_web, pattern=r"^web:"))
