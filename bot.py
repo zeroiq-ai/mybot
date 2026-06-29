@@ -849,12 +849,22 @@ async def tts_pcm(chat_id: int, text: str) -> tuple[bytes, str]:
     return base64.b64decode(b64), transcript.strip()
 
 
+def _ffmpeg_exe() -> str | None:
+    """Locate an ffmpeg binary: prefer the pip-bundled one, fall back to PATH."""
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return shutil.which("ffmpeg")
+
+
 async def pcm_to_ogg(pcm: bytes) -> bytes | None:
     """Encode raw PCM16 to OGG/Opus via ffmpeg (for a Telegram voice note)."""
-    if not shutil.which("ffmpeg"):
+    exe = _ffmpeg_exe()
+    if not exe:
         return None
     proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-loglevel", "error",
+        exe, "-loglevel", "error",
         "-f", "s16le", "-ar", str(TTS_SAMPLE_RATE), "-ac", "1", "-i", "pipe:0",
         "-c:a", "libopus", "-b:a", "32k", "-f", "ogg", "pipe:1",
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
