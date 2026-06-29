@@ -745,11 +745,26 @@ async def gen_chat(system: str, user_content: str, chat_id: int | None = None,
     return response.choices[0].message.content or ""
 
 
+def _delta_audio_data(delta) -> str | None:
+    """Pull a base64 audio fragment out of a streaming delta, however it's shaped."""
+    audio = getattr(delta, "audio", None)
+    if audio is None and getattr(delta, "model_extra", None):
+        audio = delta.model_extra.get("audio")
+    if audio is None:
+        return None
+    return audio.get("data") if isinstance(audio, dict) else getattr(audio, "data", None)
+
+
 async def tts_bytes(chat_id: int, text: str) -> bytes:
-    """Synthesize speech via an OpenRouter audio model. Returns OGG/Opus bytes."""
-    response = await with_retry(lambda: client.chat.completions.create(
+    """Synthesize speech via an OpenRouter audio model. Returns OGG/Opus bytes.
+
+    Audio-output models on OpenRouter require streaming, so we collect the
+    base64 audio fragments from the stream and decode the concatenation."""
+    stream = await with_retry(lambda: client.chat.completions.create(
         model=TTS_MODEL,
         messages=[{"role": "user", "content": text}],
+        stream=True,
+        stream_options={"include_usage": True},
         extra_headers={"X-Title": "Telegram Claude Bot"},
         extra_body={
             "modalities": ["text", "audio"],
@@ -757,15 +772,18 @@ async def tts_bytes(chat_id: int, text: str) -> bytes:
             "usage": {"include": True},
         },
     ))
-    log_cost(chat_id, "tts", _cost_from_response(response))
-    msg = response.choices[0].message
-    audio = getattr(msg, "audio", None)
-    if audio is None and getattr(msg, "model_extra", None):
-        audio = msg.model_extra.get("audio")
-    data = audio.get("data") if isinstance(audio, dict) else getattr(audio, "data", None)
-    if not data:
-        raise ValueError("No audio in TTS response")
-    return base64.b64decode(data)
+    b64, cost = "", 0.0
+    async for chunk in stream:
+        if chunk.choices:
+            part = _delta_audio_data(chunk.choices[0].delta)
+            if part:
+                b64 += part
+        if getattr(chunk, "usage", None):
+            cost = _cost_from_response(chunk) or cost
+    log_cost(chat_id, "tts", cost)
+    if not b64:
+        raise ValueError("No audio in TTS stream")
+    return base64.b64decode(b64)
 
 
 async def gen_opinion(chat_id: int, transcript: str) -> str:
