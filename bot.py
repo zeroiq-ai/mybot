@@ -145,7 +145,7 @@ automem_mode:  dict[int, bool]       = {}   # user_id → auto-memory on/off (de
 last_gen:      dict[int, dict]       = {}   # chat_id → last image request (for "more")
 _img_cooldown: dict[int, float]      = {}   # chat_id → last image-op timestamp
 
-MAX_HISTORY    = 40
+MAX_HISTORY    = 300
 MAX_TOKENS     = 1024
 IMAGE_COOLDOWN = 20      # seconds between image operations per chat
 MAX_MEMORIES   = 30      # max remembered facts per user
