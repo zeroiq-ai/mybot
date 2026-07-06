@@ -162,14 +162,16 @@ STARTUP_CATEGORIES = [
 # Web-enabled model (":online" gives it live search) used for the research step.
 STARTUP_MODEL = os.environ.get("OPENROUTER_STARTUP_MODEL", AUX_MODEL + ":online")
 STARTUP_PROMPT = (
-    "Сегодня {date}. Категория дня: {cat}. Сначала мысленно учти свежие новости, "
-    "события и новые технологии из этой сферы за ПОСЛЕДНИЕ СУТКИ (используй веб-поиск). "
-    "Затем предложи ОДНУ конкретную, свежую и небанальную идею стартапа, основанную на "
-    "актуальном инфоповоде/технологии. Формат ответа:\n"
+    "Сегодня {date}. Категория дня: {cat}. Сначала учти свежие новости, события и новые "
+    "технологии из этой сферы за ПОСЛЕДНИЕ СУТКИ (используй веб-поиск). Затем предложи ОДНУ "
+    "НЕСТАНДАРТНУЮ, смелую и небанальную идею стартапа. ИЗБЕГАЙ очевидных шаблонов "
+    "(«Uber для X», «ИИ-чат-бот для Y», «маркетплейс для Z»). Дай неожиданный угол, "
+    "контринтуитивную механику или необычную бизнес-модель — но идея должна оставаться "
+    "реалистичной и реализуемой.\n\n"
+    "Формат ответа (обычный текст, БЕЗ Markdown, БЕЗ ссылок и без блока про источники):\n"
     "🚀 <цепляющее название>\n"
-    "<2–3 предложения сути: что делает и для кого>\n"
-    "📎 На чём основано: <какой инфоповод/технология за сутки>\n"
-    "Пиши бодро, с лёгким юмором, без воды. Не добавляй ничего лишнего сверх формата."
+    "<2–3 предложения: что делает, для кого и в чём именно неожиданность>\n\n"
+    "Пиши бодро, с лёгким юмором, без воды."
 )
 
 # ── Per-user state: model + conversation history ──────────────────────────────
@@ -1011,13 +1013,29 @@ async def post_startup(context: ContextTypes.DEFAULT_TYPE, chat_id: int, categor
     """Send a startup idea (with optional image + sources) and a vote poll to a chat."""
     header = f"💡 Стартап дня — категория «{category}»\n\n"
     body = header + idea
+
+    async def _send_html(text: str) -> None:
+        try:
+            await context.bot.send_message(chat_id, md_to_html(text), parse_mode="HTML",
+                                           disable_web_page_preview=True)
+        except Exception:
+            await context.bot.send_message(chat_id, strip_md(text))
+
     if image:
-        cap = body if len(body) <= 1024 else header.strip()
-        await context.bot.send_photo(chat_id, photo=io.BytesIO(image), caption=cap)
-        if len(body) > 1024:
-            await context.bot.send_message(chat_id, idea)
+        if len(body) <= 1024:
+            try:
+                await context.bot.send_photo(chat_id, photo=io.BytesIO(image),
+                                             caption=md_to_html(body), parse_mode="HTML")
+            except Exception:
+                await context.bot.send_photo(chat_id, photo=io.BytesIO(image),
+                                             caption=strip_md(body))
+        else:
+            await context.bot.send_photo(chat_id, photo=io.BytesIO(image),
+                                         caption="💡 Стартап дня")
+            await _send_html(body)
     else:
-        await context.bot.send_message(chat_id, body)
+        await _send_html(body)
+
     if sources:
         links = "\n".join(f"• <a href=\"{html.escape(u)}\">{html.escape(t[:80])}</a>"
                           for t, u in sources)
