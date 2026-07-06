@@ -152,6 +152,26 @@ GREETING_PROMPT = (
 # Timezone for the daily greeting.
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
+# Daily "startup idea of the day": category rotates, grounded in last-24h news.
+STARTUP_CATEGORIES = [
+    "экология", "криптовалюты и web3", "игры", "мобильные приложения",
+    "искусственный интеллект", "финтех", "здоровье и медтех", "образование",
+    "еда и фудтех", "транспорт и логистика", "мода и ретейл", "космос",
+    "робототехника", "социальные сети и медиа",
+]
+# Web-enabled model (":online" gives it live search) used for the research step.
+STARTUP_MODEL = os.environ.get("OPENROUTER_STARTUP_MODEL", AUX_MODEL + ":online")
+STARTUP_PROMPT = (
+    "Сегодня {date}. Категория дня: {cat}. Сначала мысленно учти свежие новости, "
+    "события и новые технологии из этой сферы за ПОСЛЕДНИЕ СУТКИ (используй веб-поиск). "
+    "Затем предложи ОДНУ конкретную, свежую и небанальную идею стартапа, основанную на "
+    "актуальном инфоповоде/технологии. Формат ответа:\n"
+    "🚀 <цепляющее название>\n"
+    "<2–3 предложения сути: что делает и для кого>\n"
+    "📎 На чём основано: <какой инфоповод/технология за сутки>\n"
+    "Пиши бодро, с лёгким юмором, без воды. Не добавляй ничего лишнего сверх формата."
+)
+
 # ── Per-user state: model + conversation history ──────────────────────────────
 # History is keyed per (chat_id, user_id) so users in a group get separate threads.
 conversations: dict[tuple[int, int], list[dict]] = defaultdict(list)
@@ -167,6 +187,7 @@ web_mode:      dict[int, bool]       = {}   # chat_id → web search on/off (def
 memories:      dict[int, list[str]]  = defaultdict(list)  # user_id → remembered facts
 automem_mode:  dict[int, bool]       = {}   # user_id → auto-memory on/off (default ON)
 spontan_mode:  dict[int, bool]       = {}   # chat_id → spontaneous chime-in on/off (default ON)
+startup_mode:  dict[int, bool]       = {}   # chat_id → daily startup idea on/off (default ON)
 last_gen:      dict[int, dict]       = {}   # chat_id → last image request (for "more")
 _img_cooldown: dict[int, float]      = {}   # chat_id → last image-op timestamp
 _grp_buffer:   dict[int, list[tuple[float, str]]] = defaultdict(list)  # recent group msgs
@@ -279,15 +300,17 @@ def db_init() -> None:
         _add_column("chat_state", "spontan", "INTEGER")
         _add_column("chat_state", "voice", "TEXT")
         _add_column("chat_state", "vid_model", "TEXT")
+        _add_column("chat_state", "startup", "INTEGER")
         _add_column("messages", "user_id", "INTEGER")
         _add_column("memories", "user_id", "INTEGER")
         _db.execute("CREATE INDEX IF NOT EXISTS idx_messages_key ON messages(chat_id, user_id, id)")
         _db.execute("CREATE INDEX IF NOT EXISTS idx_mem_user ON memories(user_id, id)")
         _db.commit()
 
-        for chat_id, model, cursed, la, morning, web, imgm, spontan, voice, vidm in _db.execute(
+        for (chat_id, model, cursed, la, morning, web, imgm, spontan, voice, vidm,
+             startup) in _db.execute(
             "SELECT chat_id, model, cursed, last_active, morning, web, img_model, spontan, voice, "
-            "vid_model FROM chat_state"
+            "vid_model, startup FROM chat_state"
         ):
             if model:
                 user_model[chat_id] = model
@@ -307,6 +330,8 @@ def db_init() -> None:
                 chat_voice[chat_id] = voice
             if vidm:
                 video_model[chat_id] = vidm
+            if startup is not None:
+                startup_mode[chat_id] = bool(startup)
         # Old rows have NULL user_id; private chats have chat_id == user_id, so
         # coalescing NULL→chat_id keeps legacy history reachable.
         for chat_id, user_id, role, content in _db.execute(
@@ -335,16 +360,18 @@ def save_chat_state(chat_id: int) -> None:
         _db.execute(
             "INSERT INTO chat_state"
             "(chat_id, model, cursed, last_active, morning, web, img_model, spontan, voice, "
-            "vid_model) VALUES(?,?,?,?,?,?,?,?,?,?) "
+            "vid_model, startup) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(chat_id) DO UPDATE SET "
             "model=excluded.model, cursed=excluded.cursed, last_active=excluded.last_active, "
             "morning=excluded.morning, web=excluded.web, img_model=excluded.img_model, "
-            "spontan=excluded.spontan, voice=excluded.voice, vid_model=excluded.vid_model",
+            "spontan=excluded.spontan, voice=excluded.voice, vid_model=excluded.vid_model, "
+            "startup=excluded.startup",
             (chat_id, user_model.get(chat_id),
              1 if get_cursed(chat_id) else 0, last_active.get(chat_id),
              1 if get_morning(chat_id) else 0, 1 if get_web(chat_id) else 0,
              image_model.get(chat_id), 1 if get_chime(chat_id) else 0,
-             chat_voice.get(chat_id), video_model.get(chat_id)),
+             chat_voice.get(chat_id), video_model.get(chat_id),
+             1 if get_startup(chat_id) else 0),
         )
         _db.commit()
 
@@ -456,6 +483,10 @@ def get_automem(user_id: int) -> bool:
 
 def get_chime(chat_id: int) -> bool:
     return spontan_mode.get(chat_id, True)
+
+
+def get_startup(chat_id: int) -> bool:
+    return startup_mode.get(chat_id, True)
 
 
 TTS_LANGS = ("auto", "ru", "en")
@@ -928,6 +959,75 @@ async def gen_opinion(chat_id: int, transcript: str) -> str:
     return response.choices[0].message.content or ""
 
 
+def _extract_citations(message) -> list[tuple[str, str]]:
+    """Pull up to 3 (title, url) web citations from a web-search response."""
+    ann = getattr(message, "annotations", None)
+    if ann is None and getattr(message, "model_extra", None):
+        ann = message.model_extra.get("annotations")
+    out, seen = [], set()
+    for a in ann or []:
+        a = a if isinstance(a, dict) else (getattr(a, "model_dump", lambda: {})() or {})
+        uc = a.get("url_citation") or {}
+        url = uc.get("url")
+        if url and url not in seen:
+            seen.add(url)
+            out.append((uc.get("title") or url, url))
+        if len(out) >= 3:
+            break
+    return out
+
+
+async def gen_startup(category: str) -> tuple[str, float, list[tuple[str, str]]]:
+    """Research last-24h news (web search) → (idea_text, cost, sources)."""
+    today = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
+    prompt = STARTUP_PROMPT.format(date=today, cat=category)
+    response = await with_retry(lambda: client.chat.completions.create(
+        model=STARTUP_MODEL,
+        max_tokens=600,
+        temperature=0.9,
+        messages=[{"role": "user", "content": prompt}],
+        extra_headers={"X-Title": "Telegram Claude Bot"},
+        extra_body={"usage": {"include": True}},
+    ))
+    msg = response.choices[0].message
+    return (msg.content or "").strip(), _cost_from_response(response), _extract_citations(msg)
+
+
+async def startup_image(chat_id: int, idea: str, category: str) -> tuple[bytes, float] | None:
+    """Generate an illustration for a startup idea. Returns (bytes, cost) or None."""
+    headline = idea.splitlines()[0].lstrip("🚀 ").strip() if idea else category
+    prompt = (f"Clean modern startup concept art illustrating: {headline}. "
+              f"Theme: {category}. Vibrant hero shot, product/marketing style, no text.")
+    try:
+        return await generate_image(prompt, "16:9", model=get_image_model(chat_id))
+    except Exception:
+        logger.exception("Startup image failed")
+        return None
+
+
+async def post_startup(context: ContextTypes.DEFAULT_TYPE, chat_id: int, category: str,
+                       idea: str, sources: list[tuple[str, str]],
+                       image: bytes | None) -> None:
+    """Send a startup idea (with optional image + sources) and a vote poll to a chat."""
+    header = f"💡 Стартап дня — категория «{category}»\n\n"
+    body = header + idea
+    if image:
+        cap = body if len(body) <= 1024 else header.strip()
+        await context.bot.send_photo(chat_id, photo=io.BytesIO(image), caption=cap)
+        if len(body) > 1024:
+            await context.bot.send_message(chat_id, idea)
+    else:
+        await context.bot.send_message(chat_id, body)
+    if sources:
+        links = "\n".join(f"• <a href=\"{html.escape(u)}\">{html.escape(t[:80])}</a>"
+                          for t, u in sources)
+        await context.bot.send_message(chat_id, "📰 Источники:\n" + links,
+                                       parse_mode="HTML", disable_web_page_preview=True)
+    await context.bot.send_poll(
+        chat_id, f"Оценка стартапа дня ({category}):",
+        ["🔥 Годно", "💩 Дерьмище"], is_anonymous=False)
+
+
 def _touch(chat_id: int) -> None:
     """Mark a chat as active right now (used to pick recipients for daily greeting)."""
     last_active[chat_id] = time.time()
@@ -1149,6 +1249,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/imagine <prompt> [--ratio 16:9] — сгенерировать картинку\n"
         "/cursed — всратый режим 😈\n"
         "/chime — спонтанные вбросы в беседу 🗣\n"
+        "/idea [категория] — стартап-идея с картинкой и источниками 💡\n"
+        "/startup — «стартап дня» вкл/выкл (12:00 МСК)\n"
         "/web — веб-поиск 🌐\n"
         "/morning — утренние пожелания 🌅\n"
         "/remember, /memory, /forget — личная память 🧠\n"
@@ -1905,6 +2007,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/voice — язык озвучки (авто/ru/en)\n"
         "/cursed — всратый режим 😈\n"
         "/chime — спонтанные вбросы в беседу 🗣\n"
+        "/idea [категория] — стартап-идея с картинкой и источниками 💡\n"
+        "/startup — «стартап дня» вкл/выкл (12:00 МСК)\n"
         "/web — веб-поиск 🌐\n"
         "/morning — утренние пожелания 🌅\n"
         "/remember <факт>, /memory, /forget — личная память 🧠\n"
@@ -1966,6 +2070,60 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"• этот чат всего:   ${total:.4f}\n"
         f"• все чаты всего:   ${grand:.4f}"
     )
+
+
+async def cmd_idea(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate a startup idea right now (optional category argument)."""
+    chat_id = update.effective_chat.id
+    cat = " ".join(context.args).strip() or STARTUP_CATEGORIES[
+        datetime.now(MOSCOW_TZ).timetuple().tm_yday % len(STARTUP_CATEGORIES)]
+    status = await update.message.reply_text("🔎 Ищу свежие новости и придумываю идею…")
+    try:
+        idea, cost, sources = await gen_startup(cat)
+        if not idea:
+            await status.edit_text("⚠️ Не получилось придумать идею, попробуй ещё раз.")
+            return
+        img = await startup_image(chat_id, idea, cat)
+        log_cost(chat_id, "startup", cost + (img[1] if img else 0.0))
+        await status.delete()
+        await post_startup(context, chat_id, cat, idea, sources, img[0] if img else None)
+    except httpx.HTTPStatusError as e:
+        detail = _openrouter_error_text(e.response)
+        logger.error("Idea API error: %s — %s", e.response.status_code, detail)
+        await status.edit_text(f"⚠️ Ошибка (HTTP {e.response.status_code}): {detail}")
+    except Exception as e:
+        logger.exception("Idea error")
+        await status.edit_text(f"⚠️ Не вышло: {e}")
+
+
+def startup_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    on = get_startup(chat_id)
+    text = "🔴 Выключить стартап дня" if on else "🟢 Включить стартап дня"
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(text, callback_data=f"startupd:{'off' if on else 'on'}")]]
+    )
+
+
+async def cmd_startup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    state = "включён 💡" if get_startup(chat_id) else "выключен"
+    await update.message.reply_text(
+        f"«Стартап дня» сейчас {state}.\n\n"
+        "Каждый день в 12:00 (МСК) я делаю мини-ресерч свежих новостей, придумываю идею "
+        "стартапа в категории дня (с картинкой и источниками) и добавляю голосование. "
+        "Сгенерировать прямо сейчас — /idea [категория].",
+        reply_markup=startup_keyboard(chat_id),
+    )
+
+
+async def callback_startup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    startup_mode[chat_id] = (query.data.split(":", 1)[1] == "on")
+    save_chat_state(chat_id)
+    state = "включён 💡" if startup_mode[chat_id] else "выключен"
+    await query.edit_message_text(f"«Стартап дня» {state}.", reply_markup=startup_keyboard(chat_id))
 
 
 def morning_keyboard(chat_id: int) -> InlineKeyboardMarkup:
@@ -2370,6 +2528,38 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Unhandled exception", exc_info=context.error)
 
 
+def _startup_recipients() -> list[int]:
+    """All known chats where the daily startup feature is enabled (regardless of activity)."""
+    known = set(last_active) | set(startup_mode) | set(user_model) | set(cursed_mode)
+    return [cid for cid in known if get_startup(cid)]
+
+
+async def daily_startup(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Research + post a 'startup idea of the day' (rotating category) to enabled chats."""
+    recipients = _startup_recipients()
+    if not recipients:
+        return
+    category = STARTUP_CATEGORIES[datetime.now(MOSCOW_TZ).timetuple().tm_yday % len(STARTUP_CATEGORIES)]
+    try:
+        idea, cost, sources = await gen_startup(category)
+    except Exception:
+        logger.exception("Startup idea generation failed")
+        return
+    if not idea:
+        return
+    # Generate the illustration once and reuse it for every chat.
+    img = await startup_image(recipients[0], idea, category)
+    image_bytes = img[0] if img else None
+    total_cost = cost + (img[1] if img else 0.0)
+    logger.info("Startup idea (%s) → %d chats", category, len(recipients))
+    for chat_id in recipients:
+        try:
+            log_cost(chat_id, "startup", total_cost / max(len(recipients), 1))
+            await post_startup(context, chat_id, category, idea, sources, image_bytes)
+        except Exception:
+            logger.exception("Startup post failed for chat %s", chat_id)
+
+
 async def morning_greeting(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Post a fresh 'cursed' good-morning to every chat active in the last 24h."""
     cutoff = time.time() - 24 * 3600
@@ -2409,6 +2599,8 @@ async def _post_init(app) -> None:
         BotCommand("voice",    "Язык озвучки /say"),
         BotCommand("cursed",   "Всратый режим вкл/выкл"),
         BotCommand("chime",    "Спонтанные вбросы вкл/выкл"),
+        BotCommand("idea",     "Стартап-идея сейчас 💡"),
+        BotCommand("startup",  "Стартап дня вкл/выкл"),
         BotCommand("web",      "Веб-поиск вкл/выкл"),
         BotCommand("morning",  "Утренние пожелания вкл/выкл"),
         BotCommand("remember", "Запомнить факт"),
@@ -2452,6 +2644,8 @@ def main() -> None:
     app.add_handler(CommandHandler("voice",    cmd_voice))
     app.add_handler(CommandHandler("cursed",   cmd_cursed))
     app.add_handler(CommandHandler("chime",    cmd_chime))
+    app.add_handler(CommandHandler("idea",     cmd_idea))
+    app.add_handler(CommandHandler("startup",  cmd_startup))
     app.add_handler(CommandHandler("stats",    cmd_stats))
     app.add_handler(CommandHandler("morning",  cmd_morning))
     app.add_handler(CommandHandler("web",      cmd_web))
@@ -2467,6 +2661,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(callback_morning, pattern=r"^morning:"))
     app.add_handler(CallbackQueryHandler(callback_web, pattern=r"^web:"))
     app.add_handler(CallbackQueryHandler(callback_chime, pattern=r"^chime:"))
+    app.add_handler(CallbackQueryHandler(callback_startup, pattern=r"^startupd:"))
     app.add_handler(CallbackQueryHandler(callback_automem, pattern=r"^automem:"))
     app.add_handler(CallbackQueryHandler(callback_regen, pattern=r"^regen$"))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
@@ -2482,7 +2677,12 @@ def main() -> None:
             time=dtime(hour=8, minute=0, tzinfo=MOSCOW_TZ),
             name="morning_greeting",
         )
-        logger.info("Scheduled daily morning greeting at 08:00 Europe/Moscow")
+        app.job_queue.run_daily(
+            daily_startup,
+            time=dtime(hour=12, minute=0, tzinfo=MOSCOW_TZ),
+            name="daily_startup",
+        )
+        logger.info("Scheduled daily morning greeting at 08:00 and startup idea at 12:00 Europe/Moscow")
     else:
         logger.warning("JobQueue unavailable — install python-telegram-bot[job-queue] to enable the daily greeting")
 
