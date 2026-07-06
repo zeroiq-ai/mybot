@@ -1284,7 +1284,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/cursed — всратый режим 😈\n"
         "/chime — спонтанные вбросы в беседу 🗣\n"
         "/idea [категория] — стартап-идея с картинкой и источниками 💡\n"
-        "/startup — «стартап дня» вкл/выкл (12:00 МСК)\n"
+        "/startup — «идея дня» вкл/выкл (12:00 МСК)\n"
         "/web — веб-поиск 🌐\n"
         "/morning — утренние пожелания 🌅\n"
         "/remember, /memory, /forget — личная память 🧠\n"
@@ -2042,7 +2042,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/cursed — всратый режим 😈\n"
         "/chime — спонтанные вбросы в беседу 🗣\n"
         "/idea [категория] — стартап-идея с картинкой и источниками 💡\n"
-        "/startup — «стартап дня» вкл/выкл (12:00 МСК)\n"
+        "/startup — «идея дня» вкл/выкл (12:00 МСК)\n"
         "/web — веб-поиск 🌐\n"
         "/morning — утренние пожелания 🌅\n"
         "/remember <факт>, /memory, /forget — личная память 🧠\n"
@@ -2133,7 +2133,7 @@ async def cmd_idea(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def startup_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     on = get_startup(chat_id)
-    text = "🔴 Выключить стартап дня" if on else "🟢 Включить стартап дня"
+    text = "🔴 Выключить идею дня" if on else "🟢 Включить идею дня"
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton(text, callback_data=f"startupd:{'off' if on else 'on'}")]]
     )
@@ -2141,11 +2141,11 @@ def startup_keyboard(chat_id: int) -> InlineKeyboardMarkup:
 
 async def cmd_startup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    state = "включён 💡" if get_startup(chat_id) else "выключен"
+    state = "включена 💡" if get_startup(chat_id) else "выключена"
     await update.message.reply_text(
-        f"«Стартап дня» сейчас {state}.\n\n"
-        "Каждый день в 12:00 (МСК) я делаю мини-ресерч свежих новостей, придумываю идею "
-        "стартапа в категории дня (с картинкой и источниками) и добавляю голосование. "
+        f"«Идея дня» сейчас {state}.\n\n"
+        "Каждый день в 12:00 (МСК) я делаю мини-ресерч свежих новостей и придумываю новую "
+        "уникальную идею с монетизацией (с картинкой, источниками и голосованием). "
         "Сгенерировать прямо сейчас — /idea [категория].",
         reply_markup=startup_keyboard(chat_id),
     )
@@ -2574,11 +2574,12 @@ async def daily_startup(context: ContextTypes.DEFAULT_TYPE) -> None:
     recipients = _startup_recipients()
     if not recipients:
         return
+    # Rotate the domain daily for variety, but generate an idea in the /idea style.
     category = STARTUP_CATEGORIES[datetime.now(MOSCOW_TZ).timetuple().tm_yday % len(STARTUP_CATEGORIES)]
     try:
-        idea, cost, sources = await gen_startup(category)
+        idea, cost, sources = await gen_startup(category, IDEA_PROMPT)
     except Exception:
-        logger.exception("Startup idea generation failed")
+        logger.exception("Daily idea generation failed")
         return
     if not idea:
         return
@@ -2586,13 +2587,13 @@ async def daily_startup(context: ContextTypes.DEFAULT_TYPE) -> None:
     img = await startup_image(recipients[0], idea, category)
     image_bytes = img[0] if img else None
     total_cost = cost + (img[1] if img else 0.0)
-    logger.info("Startup idea (%s) → %d chats", category, len(recipients))
+    logger.info("Daily idea (%s) → %d chats", category, len(recipients))
     for chat_id in recipients:
         try:
             log_cost(chat_id, "startup", total_cost / max(len(recipients), 1))
-            await post_startup(context, chat_id, category, idea, sources, image_bytes)
+            await post_startup(context, chat_id, category, idea, sources, image_bytes, title="Идея дня")
         except Exception:
-            logger.exception("Startup post failed for chat %s", chat_id)
+            logger.exception("Daily idea post failed for chat %s", chat_id)
 
 
 async def morning_greeting(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2635,7 +2636,7 @@ async def _post_init(app) -> None:
         BotCommand("cursed",   "Всратый режим вкл/выкл"),
         BotCommand("chime",    "Спонтанные вбросы вкл/выкл"),
         BotCommand("idea",     "Стартап-идея сейчас 💡"),
-        BotCommand("startup",  "Стартап дня вкл/выкл"),
+        BotCommand("startup",  "Идея дня вкл/выкл"),
         BotCommand("web",      "Веб-поиск вкл/выкл"),
         BotCommand("morning",  "Утренние пожелания вкл/выкл"),
         BotCommand("remember", "Запомнить факт"),
