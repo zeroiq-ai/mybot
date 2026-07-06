@@ -157,7 +157,9 @@ MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 conversations: dict[tuple[int, int], list[dict]] = defaultdict(list)
 user_model:    dict[int, str]        = {}   # chat_id → model id
 image_model:   dict[int, str]        = {}   # chat_id → image model id
+video_model:   dict[int, str]        = {}   # chat_id → video model id
 chat_voice:    dict[int, str]        = {}   # chat_id → TTS voice
+_vid_cooldown: dict[int, float]      = {}   # chat_id → last video-op timestamp
 cursed_mode:   dict[int, bool]       = {}   # chat_id → auto "cursed" remix (default ON)
 last_active:   dict[int, float]      = {}   # chat_id → epoch seconds of last activity
 morning_mode:  dict[int, bool]       = {}   # chat_id → daily greeting on/off (default ON)
@@ -198,6 +200,17 @@ IMAGE_MODELS = [
     {"id": "black-forest-labs/flux.2-pro",  "label": "⚡ FLUX.2 Pro",                  "res": False},
 ]
 ALLOWED_RESOLUTIONS = {"512", "1K", "2K", "4K"}
+
+# Video models offered via /vidmodel. dur/res are safe defaults per model.
+DEFAULT_VIDEO_MODEL = os.environ.get("OPENROUTER_VIDEO_MODEL", "alibaba/wan-2.6")
+VIDEO_MODELS = [
+    {"id": "alibaba/wan-2.6",           "label": "💸 Wan 2.6 (дёшево)",       "dur": 5, "res": "720p"},
+    {"id": "google/veo-3.1-lite",       "label": "🟢 Veo 3.1 Lite",           "dur": 6, "res": "720p"},
+    {"id": "bytedance/seedance-2.0-fast","label": "🌊 Seedance 2.0 Fast",      "dur": 5, "res": "720p"},
+    {"id": "google/veo-3.1",            "label": "⭐ Veo 3.1 (дорого)",        "dur": 6, "res": "720p"},
+    {"id": "openai/sora-2-pro",         "label": "🎬 Sora 2 Pro (премиум)",   "dur": 4, "res": "720p"},
+]
+VIDEO_COOLDOWN = 60   # seconds between video jobs per chat (they are slow + costly)
 
 # ── Persistence (SQLite) ──────────────────────────────────────────────────────
 # NOTE: on Railway the filesystem is ephemeral. Attach a Volume and point
@@ -265,15 +278,16 @@ def db_init() -> None:
         _add_column("chat_state", "img_model", "TEXT")
         _add_column("chat_state", "spontan", "INTEGER")
         _add_column("chat_state", "voice", "TEXT")
+        _add_column("chat_state", "vid_model", "TEXT")
         _add_column("messages", "user_id", "INTEGER")
         _add_column("memories", "user_id", "INTEGER")
         _db.execute("CREATE INDEX IF NOT EXISTS idx_messages_key ON messages(chat_id, user_id, id)")
         _db.execute("CREATE INDEX IF NOT EXISTS idx_mem_user ON memories(user_id, id)")
         _db.commit()
 
-        for chat_id, model, cursed, la, morning, web, imgm, spontan, voice in _db.execute(
-            "SELECT chat_id, model, cursed, last_active, morning, web, img_model, spontan, voice "
-            "FROM chat_state"
+        for chat_id, model, cursed, la, morning, web, imgm, spontan, voice, vidm in _db.execute(
+            "SELECT chat_id, model, cursed, last_active, morning, web, img_model, spontan, voice, "
+            "vid_model FROM chat_state"
         ):
             if model:
                 user_model[chat_id] = model
@@ -291,6 +305,8 @@ def db_init() -> None:
                 spontan_mode[chat_id] = bool(spontan)
             if voice:
                 chat_voice[chat_id] = voice
+            if vidm:
+                video_model[chat_id] = vidm
         # Old rows have NULL user_id; private chats have chat_id == user_id, so
         # coalescing NULL→chat_id keeps legacy history reachable.
         for chat_id, user_id, role, content in _db.execute(
@@ -318,17 +334,17 @@ def save_chat_state(chat_id: int) -> None:
     with _db_lock:
         _db.execute(
             "INSERT INTO chat_state"
-            "(chat_id, model, cursed, last_active, morning, web, img_model, spontan, voice) "
-            "VALUES(?,?,?,?,?,?,?,?,?) "
+            "(chat_id, model, cursed, last_active, morning, web, img_model, spontan, voice, "
+            "vid_model) VALUES(?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(chat_id) DO UPDATE SET "
             "model=excluded.model, cursed=excluded.cursed, last_active=excluded.last_active, "
             "morning=excluded.morning, web=excluded.web, img_model=excluded.img_model, "
-            "spontan=excluded.spontan, voice=excluded.voice",
+            "spontan=excluded.spontan, voice=excluded.voice, vid_model=excluded.vid_model",
             (chat_id, user_model.get(chat_id),
              1 if get_cursed(chat_id) else 0, last_active.get(chat_id),
              1 if get_morning(chat_id) else 0, 1 if get_web(chat_id) else 0,
              image_model.get(chat_id), 1 if get_chime(chat_id) else 0,
-             chat_voice.get(chat_id)),
+             chat_voice.get(chat_id), video_model.get(chat_id)),
         )
         _db.commit()
 
@@ -476,6 +492,25 @@ def build_voice_system(user_id: int, chat_id: int | None = None) -> str:
 
 def get_image_model(chat_id: int) -> str:
     return image_model.get(chat_id, IMAGE_MODEL)
+
+
+def get_video_model(chat_id: int) -> str:
+    return video_model.get(chat_id, DEFAULT_VIDEO_MODEL)
+
+
+def video_conf(model_id: str) -> dict:
+    for m in VIDEO_MODELS:
+        if m["id"] == model_id:
+            return m
+    return {"id": model_id, "label": model_id, "dur": 6, "res": "720p"}
+
+
+def _vid_cooldown_left(chat_id: int) -> float:
+    return max(0.0, VIDEO_COOLDOWN - (time.time() - _vid_cooldown.get(chat_id, 0)))
+
+
+def _mark_video(chat_id: int) -> None:
+    _vid_cooldown[chat_id] = time.time()
 
 
 def _image_model_supports_res(chat_id: int) -> bool:
@@ -986,6 +1021,58 @@ async def generate_image(
     raise ValueError(f"Unexpected image response: {list(item.keys())}")
 
 
+async def generate_video(prompt: str, model: str, frame_image: str | None = None,
+                         on_status=None) -> tuple[bytes, float]:
+    """Submit an async video job, poll to completion, download the MP4.
+
+    Returns (mp4_bytes, cost_usd). `on_status(status)` is called on each poll."""
+    conf = video_conf(model)
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "duration": conf["dur"],
+        "resolution": conf["res"],
+        "aspect_ratio": "16:9",
+        "generate_audio": True,
+    }
+    if frame_image:
+        payload["frame_images"] = [{
+            "type": "image_url",
+            "image_url": {"url": frame_image},
+            "frame_type": "first_frame",
+        }]
+
+    async with httpx.AsyncClient(timeout=60) as http:
+        resp = await http.post("https://openrouter.ai/api/v1/videos",
+                               headers=OR_HEADERS, json=payload)
+        resp.raise_for_status()
+        job = resp.json()
+    polling_url = job.get("polling_url") or \
+        f"https://openrouter.ai/api/v1/videos/{job['id']}"
+
+    deadline = time.time() + 480   # up to 8 minutes
+    while time.time() < deadline:
+        await asyncio.sleep(15)
+        async with httpx.AsyncClient(timeout=60) as http:
+            pr = await http.get(polling_url, headers=OR_HEADERS)
+            pr.raise_for_status()
+            st = pr.json()
+        status = st.get("status")
+        if on_status:
+            await on_status(status)
+        if status == "completed":
+            cost = float((st.get("usage") or {}).get("cost") or 0.0)
+            urls = st.get("unsigned_urls") or []
+            content_url = urls[0] if urls else f"{polling_url}/content?index=0"
+            async with httpx.AsyncClient(timeout=180) as http:
+                vr = await http.get(content_url, headers=OR_HEADERS)
+                vr.raise_for_status()
+                return vr.content, cost
+        if status in ("failed", "cancelled", "expired"):
+            raise ValueError(st.get("error") or f"video job {status}")
+    raise TimeoutError("Видео генерируется слишком долго — попробуй позже.")
+
+
 def _openrouter_error_text(resp: httpx.Response) -> str:
     """Extract a human-readable error message from an OpenRouter error response."""
     try:
@@ -1116,6 +1203,35 @@ async def callback_set_voice(update: Update, context: ContextTypes.DEFAULT_TYPE)
         save_chat_state(chat_id)
     await query.edit_message_text(
         f"🎙 Язык озвучки: {_LANG_LABELS[get_lang(chat_id)]}", reply_markup=voice_keyboard(chat_id))
+
+
+def vidmodel_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    current = get_video_model(chat_id)
+    rows = [[InlineKeyboardButton(("✅ " if m["id"] == current else "") + m["label"],
+                                  callback_data=f"setvid:{m['id']}")] for m in VIDEO_MODELS]
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_vidmodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    label = next((m["label"] for m in VIDEO_MODELS if m["id"] == get_video_model(chat_id)),
+                 get_video_model(chat_id))
+    await update.message.reply_text(
+        f"Текущая видео-модель: {label}\n\n"
+        "Выбери модель для /video и /videoit (учти — видео платное за секунду):",
+        reply_markup=vidmodel_keyboard(chat_id),
+    )
+
+
+async def callback_set_vid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    video_model[chat_id] = query.data.split(":", 1)[1]
+    save_chat_state(chat_id)
+    label = next((m["label"] for m in VIDEO_MODELS if m["id"] == video_model[chat_id]),
+                 video_model[chat_id])
+    await query.edit_message_text(f"✅ Видео-модель: {label}", reply_markup=vidmodel_keyboard(chat_id))
 
 
 async def cmd_imgmodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1402,6 +1518,82 @@ async def cmd_imagineit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await status.edit_text(f"⚠️ Что-то пошло не так: {e}")
 
 
+async def gen_video_prompt(chat_id: int, basis: str) -> str:
+    instr = ("На основе этого придумай яркий промпт для генерации ВИДЕО: опиши сцену, движение, "
+             "камеру и атмосферу. Верни ТОЛЬКО промпт на английском, 1–2 строки, без пояснений.\n\n"
+             + basis)
+    return (await gen_text(instr, max_tokens=200, temperature=0.9,
+                           chat_id=chat_id, kind="scene")).strip()
+
+
+async def _run_video(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                     chat_id: int, prompt: str, frame_image: str | None = None) -> None:
+    rem = _vid_cooldown_left(chat_id)
+    if rem > 0:
+        await update.message.reply_text(f"⏳ Видео дорогое — подожди ещё {int(rem) + 1}с.")
+        return
+    _mark_video(chat_id)
+    conf = video_conf(get_video_model(chat_id))
+    await context.bot.send_chat_action(chat_id=chat_id, action="upload_video")
+    status = await update.message.reply_text(
+        f"🎬 Генерирую видео на {conf['label']} (~{conf['dur']}с). Это займёт до пары минут…")
+
+    async def on_status(s):
+        try:
+            await context.bot.send_chat_action(chat_id=chat_id, action="upload_video")
+        except Exception:
+            pass
+
+    try:
+        mp4, cost = await generate_video(prompt, get_video_model(chat_id), frame_image, on_status)
+        log_cost(chat_id, "video", cost)
+        bio = io.BytesIO(mp4)
+        bio.name = "video.mp4"
+        await update.message.reply_video(video=bio, caption=f"🎬 {prompt}"[:1024])
+        await status.delete()
+    except httpx.HTTPStatusError as e:
+        detail = _openrouter_error_text(e.response)
+        logger.error("Video API error: %s — %s", e.response.status_code, detail)
+        await status.edit_text(f"⚠️ Ошибка видео (HTTP {e.response.status_code}): {detail}")
+    except Exception as e:
+        logger.exception("Video error")
+        await status.edit_text(f"⚠️ Не вышло сгенерировать видео: {e}")
+
+
+async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    prompt = " ".join(context.args).strip()
+    if not prompt:
+        await update.message.reply_text(
+            "Использование: /video <промпт>\nВыбрать модель и цену: /vidmodel")
+        return
+    await _run_video(update, context, chat_id, prompt)
+
+
+async def cmd_videoit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply to a message with /videoit → make a video from its content."""
+    chat_id = update.effective_chat.id
+    msg = update.message
+    reply = msg.reply_to_message
+    if not reply:
+        await msg.reply_text("Ответь этой командой на сообщение, которое нужно оживить в видео 🎬")
+        return
+    extra = " ".join(context.args).strip()
+    src_text = (reply.text or reply.caption or "").strip()
+    reply_photo = reply.photo[-1] if reply.photo else None
+    if not src_text and not reply_photo:
+        await msg.reply_text("В том сообщении нет текста или фото для видео.")
+        return
+
+    frame = None
+    if reply_photo and get_video_model(chat_id) != "openai/sora-2-pro":
+        raw = await download_tg_file(context, reply_photo.file_id)
+        frame = _data_url(raw, "image/jpeg")
+    basis = " ".join(x for x in [src_text, extra] if x).strip() or "Оживи это изображение."
+    prompt = await gen_video_prompt(chat_id, basis)
+    await _run_video(update, context, chat_id, prompt, frame_image=frame)
+
+
 async def send_md(message, text: str) -> None:
     """Send model output as HTML (rendered Markdown); fall back to clean plain text."""
     rendered = md_to_html(text)
@@ -1619,6 +1811,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/imgmodel — выбрать модель картинок\n"
         "/scene [N] — картинка по последним N сообщениям 🖼\n"
         "/imagineit — reply на сообщение → визуализирую его 🖼\n"
+        "/video <промпт> — сгенерировать видео 🎬 (платно, /vidmodel)\n"
+        "/videoit — reply на сообщение → видео по нему 🎬\n"
         "/roast [@кто|reply] — поджарить участника 🔥\n"
         "/summary [N] — саркастичные итоги чата\n"
         "/poll [тема] — шуточный опрос\n"
@@ -2117,6 +2311,9 @@ async def _post_init(app) -> None:
         BotCommand("imgmodel", "Модель картинок"),
         BotCommand("scene",     "Картинка по последним сообщениям"),
         BotCommand("imagineit", "Визуализировать сообщение (reply)"),
+        BotCommand("video",     "Сгенерировать видео 🎬"),
+        BotCommand("videoit",   "Видео по сообщению (reply)"),
+        BotCommand("vidmodel",  "Видео-модель"),
         BotCommand("roast",    "Поджарить участника 🔥"),
         BotCommand("summary",  "Саркастичные итоги чата"),
         BotCommand("poll",     "Шуточный опрос по теме"),
@@ -2156,6 +2353,9 @@ def main() -> None:
     app.add_handler(CommandHandler("imgmodel", cmd_imgmodel))
     app.add_handler(CommandHandler("scene",    cmd_scene))
     app.add_handler(CommandHandler("imagineit", cmd_imagineit))
+    app.add_handler(CommandHandler("video",     cmd_video))
+    app.add_handler(CommandHandler("videoit",   cmd_videoit))
+    app.add_handler(CommandHandler("vidmodel",  cmd_vidmodel))
     app.add_handler(CommandHandler("roast",    cmd_roast))
     app.add_handler(CommandHandler("summary",  cmd_summary))
     app.add_handler(CommandHandler("8ball",    cmd_8ball))
@@ -2175,6 +2375,7 @@ def main() -> None:
     app.add_handler(CommandHandler("automem",  cmd_automem))
     app.add_handler(CallbackQueryHandler(callback_set_model, pattern=r"^setmodel:"))
     app.add_handler(CallbackQueryHandler(callback_set_img, pattern=r"^setimg:"))
+    app.add_handler(CallbackQueryHandler(callback_set_vid, pattern=r"^setvid:"))
     app.add_handler(CallbackQueryHandler(callback_set_voice, pattern=r"^setvoice:"))
     app.add_handler(CallbackQueryHandler(callback_cursed, pattern=r"^cursed:"))
     app.add_handler(CallbackQueryHandler(callback_morning, pattern=r"^morning:"))
