@@ -174,6 +174,21 @@ STARTUP_PROMPT = (
     "Пиши бодро, с лёгким юмором, без воды."
 )
 
+# On-demand /idea: a unique idea or a bold twist on an existing one, monetizable.
+IDEA_PROMPT = (
+    "Сегодня {date}. Сфера: {cat}. Учти свежие новости и технологии за последние сутки "
+    "(используй веб-поиск). Придумай ОДНУ по-настоящему уникальную бизнес-идею: либо совершенно "
+    "новую, либо возьми уже существующую модель и НЕОЖИДАННО переверни/разверни её "
+    "(контринтуитивный твист). Идея должна быть РЕАЛЬНОЙ и реализуемой, и на ней можно "
+    "ЗАРАБОТАТЬ, если впрячься — чётко укажи, где деньги (кто платит и за что). Избегай "
+    "шаблонов («Uber для X», «ИИ-бот для Y», «маркетплейс для Z»).\n\n"
+    "Формат (обычный текст, БЕЗ Markdown, БЕЗ ссылок):\n"
+    "🚀 <название>\n"
+    "<2–3 предложения: что делает и в чём необычность/твист>\n"
+    "💰 <1–2 предложения: как и на чём зарабатывает>\n\n"
+    "Пиши бодро, по делу, без воды."
+)
+
 # ── Per-user state: model + conversation history ──────────────────────────────
 # History is keyed per (chat_id, user_id) so users in a group get separate threads.
 conversations: dict[tuple[int, int], list[dict]] = defaultdict(list)
@@ -979,10 +994,11 @@ def _extract_citations(message) -> list[tuple[str, str]]:
     return out
 
 
-async def gen_startup(category: str) -> tuple[str, float, list[tuple[str, str]]]:
+async def gen_startup(category: str | None,
+                      template: str = STARTUP_PROMPT) -> tuple[str, float, list[tuple[str, str]]]:
     """Research last-24h news (web search) → (idea_text, cost, sources)."""
     today = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
-    prompt = STARTUP_PROMPT.format(date=today, cat=category)
+    prompt = template.format(date=today, cat=category or "любая (выбери сам)")
     response = await with_retry(lambda: client.chat.completions.create(
         model=STARTUP_MODEL,
         max_tokens=600,
@@ -1009,9 +1025,9 @@ async def startup_image(chat_id: int, idea: str, category: str) -> tuple[bytes, 
 
 async def post_startup(context: ContextTypes.DEFAULT_TYPE, chat_id: int, category: str,
                        idea: str, sources: list[tuple[str, str]],
-                       image: bytes | None) -> None:
+                       image: bytes | None, title: str = "Стартап дня") -> None:
     """Send a startup idea (with optional image + sources) and a vote poll to a chat."""
-    header = f"💡 Стартап дня — категория «{category}»\n\n"
+    header = f"💡 {title} — «{category}»\n\n"
     body = header + idea
 
     async def _send_html(text: str) -> None:
@@ -1031,7 +1047,7 @@ async def post_startup(context: ContextTypes.DEFAULT_TYPE, chat_id: int, categor
                                              caption=strip_md(body))
         else:
             await context.bot.send_photo(chat_id, photo=io.BytesIO(image),
-                                         caption="💡 Стартап дня")
+                                         caption=f"💡 {title}")
             await _send_html(body)
     else:
         await _send_html(body)
@@ -1042,7 +1058,7 @@ async def post_startup(context: ContextTypes.DEFAULT_TYPE, chat_id: int, categor
         await context.bot.send_message(chat_id, "📰 Источники:\n" + links,
                                        parse_mode="HTML", disable_web_page_preview=True)
     await context.bot.send_poll(
-        chat_id, f"Оценка стартапа дня ({category}):",
+        chat_id, f"Оценка ({category}): годно или дерьмище?",
         ["🔥 Годно", "💩 Дерьмище"], is_anonymous=False)
 
 
@@ -2091,20 +2107,21 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_idea(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Generate a startup idea right now (optional category argument)."""
+    """Generate a fresh, monetizable idea now (optional category argument)."""
     chat_id = update.effective_chat.id
-    cat = " ".join(context.args).strip() or STARTUP_CATEGORIES[
-        datetime.now(MOSCOW_TZ).timetuple().tm_yday % len(STARTUP_CATEGORIES)]
+    cat = " ".join(context.args).strip() or None
+    disp = cat or "свободная тема"
     status = await update.message.reply_text("🔎 Ищу свежие новости и придумываю идею…")
     try:
-        idea, cost, sources = await gen_startup(cat)
+        idea, cost, sources = await gen_startup(cat, IDEA_PROMPT)
         if not idea:
             await status.edit_text("⚠️ Не получилось придумать идею, попробуй ещё раз.")
             return
-        img = await startup_image(chat_id, idea, cat)
+        img = await startup_image(chat_id, idea, cat or "startup")
         log_cost(chat_id, "startup", cost + (img[1] if img else 0.0))
         await status.delete()
-        await post_startup(context, chat_id, cat, idea, sources, img[0] if img else None)
+        await post_startup(context, chat_id, disp, idea, sources,
+                           img[0] if img else None, title="Идея")
     except httpx.HTTPStatusError as e:
         detail = _openrouter_error_text(e.response)
         logger.error("Idea API error: %s — %s", e.response.status_code, detail)
