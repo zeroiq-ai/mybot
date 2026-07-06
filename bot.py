@@ -486,7 +486,7 @@ def get_chime(chat_id: int) -> bool:
 
 
 def get_startup(chat_id: int) -> bool:
-    return startup_mode.get(chat_id, True)
+    return startup_mode.get(chat_id, False)
 
 
 TTS_LANGS = ("auto", "ru", "en")
