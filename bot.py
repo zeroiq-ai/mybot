@@ -1116,6 +1116,25 @@ def _strip_bot_mention(text: str, context: ContextTypes.DEFAULT_TYPE) -> str:
     return text.replace(f"@{context.bot.username}", "").strip()
 
 
+_VISION_TRIGGERS = (
+    "опиши", "что на", "что это", "что тут", "что здесь", "что изображ", "что за", "кто на",
+    "кто это", "сколько", "переведи", "прочит", "распозна", "анализ", "объясни", "определи",
+    "describe", "what is", "what's", "what are", "who is", "how many", "analyze", "translate",
+    "read this", "explain",
+)
+_QUESTION_STARTS = (
+    "что", "кто", "где", "когда", "почему", "зачем", "какой", "какая", "какие", "сколько",
+    "what", "who", "where", "why", "how", "which",
+)
+
+
+def _photo_is_question(text: str) -> bool:
+    """Heuristic: is the photo caption a question / describe-request (vs an edit)?"""
+    t = text.strip().lower()
+    return (t.endswith("?") or t.startswith(_QUESTION_STARTS)
+            or any(k in t for k in _VISION_TRIGGERS))
+
+
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
@@ -1518,6 +1537,44 @@ async def cmd_imagineit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await status.edit_text(f"⚠️ Что-то пошло не так: {e}")
 
 
+async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply to a photo with /ask <question> → the bot analyses it and answers."""
+    chat_id, user_id = _ids(update)
+    msg = update.message
+    reply = msg.reply_to_message
+    file_id = mime = None
+    if reply and reply.photo:
+        file_id, mime = reply.photo[-1].file_id, "image/jpeg"
+    elif reply and reply.document and (reply.document.mime_type or "").startswith("image/"):
+        file_id, mime = reply.document.file_id, reply.document.mime_type
+    if not file_id:
+        await msg.reply_text("Ответь командой /ask <вопрос> на сообщение с фото 🖼")
+        return
+    question = " ".join(context.args).strip() or "Что на этом изображении? Опиши и выдели важное."
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    try:
+        raw = await download_tg_file(context, file_id)
+        answer = await gen_vision(
+            build_system(user_id, chat_id),
+            [{"type": "text", "text": question},
+             {"type": "image_url", "image_url": {"url": _data_url(raw, mime)}}],
+            chat_id)
+        key = (chat_id, user_id)
+        conversations[key].append({"role": "user", "content": f"[изображение] {question}"})
+        conversations[key].append({"role": "assistant", "content": answer})
+        trim_history(key)
+        save_message(chat_id, user_id, "user", f"[изображение] {question}")
+        save_message(chat_id, user_id, "assistant", answer)
+        await send_md(msg, answer or "⚠️ Не удалось разобрать изображение.")
+    except httpx.HTTPStatusError as e:
+        detail = _openrouter_error_text(e.response)
+        logger.error("Ask API error: %s — %s", e.response.status_code, detail)
+        await msg.reply_text(f"⚠️ Ошибка (HTTP {e.response.status_code}): {detail}")
+    except Exception as e:
+        logger.exception("Ask error")
+        await msg.reply_text(f"⚠️ Не получилось разобрать фото: {e}")
+
+
 async def gen_video_prompt(chat_id: int, basis: str) -> str:
     instr = ("На основе этого придумай яркий промпт для генерации ВИДЕО: опиши сцену, движение, "
              "камеру и атмосферу. Верни ТОЛЬКО промпт на английском, 1–2 строки, без пояснений.\n\n"
@@ -1681,7 +1738,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """If the bot is asked something → edit the image as requested.
     If a photo arrives with no request → auto 'cursed' remix: analyse it, then
     transform it into an absurd/funny version with a touch of dark humour."""
-    chat_id = update.effective_chat.id
+    chat_id, user_id = _ids(update)
     _touch(chat_id)
     msg = update.message
 
@@ -1702,6 +1759,32 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         prompt = _strip_bot_mention(caption, context) if _addressed_to_bot(update, context) else ""
     else:
         prompt = caption
+
+    # A question/describe caption → understand the photo and answer (not edit).
+    if prompt and _photo_is_question(prompt):
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        try:
+            raw = await download_tg_file(context, file_id)
+            answer = await gen_vision(
+                build_system(user_id, chat_id),
+                [{"type": "text", "text": prompt},
+                 {"type": "image_url", "image_url": {"url": _data_url(raw, mime)}}],
+                chat_id)
+            key = (chat_id, user_id)
+            conversations[key].append({"role": "user", "content": f"[изображение] {prompt}"})
+            conversations[key].append({"role": "assistant", "content": answer})
+            trim_history(key)
+            save_message(chat_id, user_id, "user", f"[изображение] {prompt}")
+            save_message(chat_id, user_id, "assistant", answer)
+            await send_md(msg, answer or "⚠️ Не удалось разобрать изображение.")
+        except httpx.HTTPStatusError as e:
+            detail = _openrouter_error_text(e.response)
+            logger.error("Vision QA error: %s — %s", e.response.status_code, detail)
+            await msg.reply_text(f"⚠️ Ошибка (HTTP {e.response.status_code}): {detail}")
+        except Exception as e:
+            logger.exception("Vision QA error")
+            await msg.reply_text(f"⚠️ Не получилось разобрать фото: {e}")
+        return
 
     # No explicit request + cursed mode off → stay quiet.
     if not prompt and not get_cursed(chat_id):
@@ -1802,7 +1885,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "💬 Текст — отвечу (ответ печатается на лету) и запомню беседу.\n"
         "🎙 Голосовое — распознаю и отвечу.\n"
         "🖼 Фото без запроса — переделаю во всратую смешную версию 😈\n"
-        "✏️ Фото с подписью/упоминанием — отредактирую как просишь.\n"
+        "✏️ Фото с подписью-инструкцией — отредактирую; с вопросом («что тут?») — отвечу 👁\n"
+        "❓ /ask (reply на фото) — разберу и отвечу по картинке\n"
         "📄 PDF или текстовый файл — отвечу по содержимому.\n"
         "🔄 Под картинками есть кнопка «Ещё вариант».\n\n"
         "Команды:\n"
@@ -2311,6 +2395,7 @@ async def _post_init(app) -> None:
         BotCommand("imgmodel", "Модель картинок"),
         BotCommand("scene",     "Картинка по последним сообщениям"),
         BotCommand("imagineit", "Визуализировать сообщение (reply)"),
+        BotCommand("ask",       "Спросить по фото (reply)"),
         BotCommand("video",     "Сгенерировать видео 🎬"),
         BotCommand("videoit",   "Видео по сообщению (reply)"),
         BotCommand("vidmodel",  "Видео-модель"),
@@ -2353,6 +2438,7 @@ def main() -> None:
     app.add_handler(CommandHandler("imgmodel", cmd_imgmodel))
     app.add_handler(CommandHandler("scene",    cmd_scene))
     app.add_handler(CommandHandler("imagineit", cmd_imagineit))
+    app.add_handler(CommandHandler("ask",       cmd_ask))
     app.add_handler(CommandHandler("video",     cmd_video))
     app.add_handler(CommandHandler("videoit",   cmd_videoit))
     app.add_handler(CommandHandler("vidmodel",  cmd_vidmodel))
