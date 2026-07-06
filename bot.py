@@ -1349,6 +1349,59 @@ def strip_md(text: str) -> str:
     return text
 
 
+async def cmd_imagineit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply to a message with /imagineit → visualize that message's content."""
+    chat_id = update.effective_chat.id
+    msg = update.message
+    reply = msg.reply_to_message
+    if not reply:
+        await msg.reply_text("Ответь этой командой на сообщение, которое нужно визуализировать 🖼")
+        return
+    extra = " ".join(context.args).strip()
+    src_text = (reply.text or reply.caption or "").strip()
+    reply_photo = reply.photo[-1] if reply.photo else None
+    if not src_text and not reply_photo:
+        await msg.reply_text("В том сообщении нет текста или фото для визуализации.")
+        return
+
+    rem = _cooldown_left(chat_id)
+    if rem > 0:
+        await msg.reply_text(f"⏳ Подожди ещё {int(rem) + 1}с перед следующей картинкой.")
+        return
+    _mark_image(chat_id)
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
+    status = await msg.reply_text("🖼 Визуализирую…")
+    try:
+        model = get_image_model(chat_id)
+        if reply_photo:
+            raw = await download_tg_file(context, reply_photo.file_id)
+            src = _data_url(raw, "image/jpeg")
+            basis = " ".join(x for x in [src_text, extra] if x).strip()
+            prompt = await gen_scene_prompt(chat_id, basis) if basis \
+                else "Reimagine this image creatively: same subject, fresh artistic scene."
+            out, cost = await generate_image(prompt, references=[src], model=model)
+            last_gen[chat_id] = {"kind": "edit", "prompt": prompt, "aspect": "1:1",
+                                 "src": src, "model": model, "res": None}
+        else:
+            basis = src_text + (f"\nДополнительно: {extra}" if extra else "")
+            prompt = await gen_scene_prompt(chat_id, basis)
+            out, cost = await generate_image(prompt, "1:1", model=model)
+            last_gen[chat_id] = {"kind": "imagine", "prompt": prompt, "aspect": "1:1",
+                                 "src": None, "model": model, "res": None}
+        log_cost(chat_id, "image", cost)
+        await msg.reply_photo(photo=io.BytesIO(out), caption=f"🖼 {prompt}"[:1024],
+                              reply_markup=more_keyboard())
+        await status.delete()
+    except httpx.HTTPStatusError as e:
+        detail = _openrouter_error_text(e.response)
+        logger.error("Imagineit API error: %s — %s", e.response.status_code, detail)
+        await status.edit_text(f"⚠️ Ошибка (HTTP {e.response.status_code}): {detail}")
+    except Exception as e:
+        logger.exception("Imagineit error")
+        await status.edit_text(f"⚠️ Что-то пошло не так: {e}")
+
+
 async def send_md(message, text: str) -> None:
     """Send model output as HTML (rendered Markdown); fall back to clean plain text."""
     rendered = md_to_html(text)
@@ -1565,6 +1618,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/imagine <промпт> [--ratio 16:9] [--res 2K] — сгенерировать картинку\n"
         "/imgmodel — выбрать модель картинок\n"
         "/scene [N] — картинка по последним N сообщениям 🖼\n"
+        "/imagineit — reply на сообщение → визуализирую его 🖼\n"
         "/roast [@кто|reply] — поджарить участника 🔥\n"
         "/summary [N] — саркастичные итоги чата\n"
         "/poll [тема] — шуточный опрос\n"
@@ -2061,7 +2115,8 @@ async def _post_init(app) -> None:
         BotCommand("model",   "Выбрать модель"),
         BotCommand("imagine",  "Сгенерировать картинку"),
         BotCommand("imgmodel", "Модель картинок"),
-        BotCommand("scene",    "Картинка по последним сообщениям"),
+        BotCommand("scene",     "Картинка по последним сообщениям"),
+        BotCommand("imagineit", "Визуализировать сообщение (reply)"),
         BotCommand("roast",    "Поджарить участника 🔥"),
         BotCommand("summary",  "Саркастичные итоги чата"),
         BotCommand("poll",     "Шуточный опрос по теме"),
@@ -2100,6 +2155,7 @@ def main() -> None:
     app.add_handler(CommandHandler("imagine",  cmd_imagine))
     app.add_handler(CommandHandler("imgmodel", cmd_imgmodel))
     app.add_handler(CommandHandler("scene",    cmd_scene))
+    app.add_handler(CommandHandler("imagineit", cmd_imagineit))
     app.add_handler(CommandHandler("roast",    cmd_roast))
     app.add_handler(CommandHandler("summary",  cmd_summary))
     app.add_handler(CommandHandler("8ball",    cmd_8ball))
