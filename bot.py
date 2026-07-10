@@ -1782,8 +1782,17 @@ async def cmd_videoit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if reply_photo and get_video_model(chat_id) != "openai/sora-2-pro":
         raw = await download_tg_file(context, reply_photo.file_id)
         frame = _data_url(raw, "image/jpeg")
-    basis = " ".join(x for x in [src_text, extra] if x).strip() or "Оживи это изображение."
-    prompt = await gen_video_prompt(chat_id, basis)
+
+    # Use the source text (nearly) verbatim — don't re-invent a prompt.
+    text = " ".join(x for x in [src_text, extra] if x).strip()
+    if frame:
+        # Photo becomes the first frame → the model continues from it.
+        prompt = text or "Продолжи этот кадр: естественное плавное движение, сохрани стиль и композицию."
+    else:
+        if not text:
+            await msg.reply_text("В том сообщении нет текста для видео.")
+            return
+        prompt = text
     await _run_video(update, context, chat_id, prompt, frame_image=frame)
 
 
