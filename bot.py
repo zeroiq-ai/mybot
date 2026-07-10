@@ -9,6 +9,7 @@ import base64
 import random
 import shutil
 import sqlite3
+import tempfile
 import asyncio
 import logging
 import threading
@@ -921,6 +922,76 @@ async def mp3_to_ogg(mp3: bytes) -> bytes | None:
     return out
 
 
+async def video_frames(raw: bytes, n: int = 6) -> list[bytes]:
+    """Sample up to n evenly-spaced JPEG frames from a video (via ffmpeg)."""
+    exe = _ffmpeg_exe()
+    if not exe:
+        return []
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+        f.write(raw)
+        path = f.name
+    try:
+        probe = await asyncio.create_subprocess_exec(
+            exe, "-i", path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _, err = await probe.communicate()
+        m = re.search(rb"Duration: (\d+):(\d+):(\d+\.\d+)", err)
+        dur = (int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))) if m else 0.0
+        times = [dur * (i + 0.5) / n for i in range(n)] if dur > 0 else [0.0]
+        frames = []
+        for t in times:
+            p = await asyncio.create_subprocess_exec(
+                exe, "-loglevel", "error", "-ss", f"{t:.2f}", "-i", path,
+                "-frames:v", "1", "-vf", "scale=512:-1", "-f", "image2",
+                "-vcodec", "mjpeg", "pipe:1",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            out, _ = await p.communicate()
+            if out:
+                frames.append(out)
+        return frames
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+async def answer_about_video(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                             chat_id: int, user_id: int, file_id: str, question: str) -> None:
+    """Sample frames from a video and answer a question about it."""
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    try:
+        raw = await download_tg_file(context, file_id)
+    except Exception as e:
+        logger.exception("Video download failed")
+        await update.message.reply_text(
+            f"⚠️ Не смог скачать видео (возможно, больше 20 МБ — лимит Telegram): {e}")
+        return
+    frames = await video_frames(raw, 6)
+    if not frames:
+        await update.message.reply_text("⚠️ Не удалось разобрать видео на кадры.")
+        return
+    parts = [{"type": "text", "text": f"{question}\n(Ниже — несколько кадров из видео по порядку.)"}]
+    for fr in frames:
+        parts.append({"type": "image_url", "image_url": {"url": _data_url(fr, "image/jpeg")}})
+    try:
+        answer = await gen_vision(build_system(user_id, chat_id), parts, chat_id)
+        key = (chat_id, user_id)
+        conversations[key].append({"role": "user", "content": f"[видео] {question}"})
+        conversations[key].append({"role": "assistant", "content": answer})
+        trim_history(key)
+        save_message(chat_id, user_id, "user", f"[видео] {question}")
+        save_message(chat_id, user_id, "assistant", answer)
+        await send_md(update.message, answer or "⚠️ Не удалось разобрать видео.")
+    except httpx.HTTPStatusError as e:
+        detail = _openrouter_error_text(e.response)
+        logger.error("Video QA error: %s — %s", e.response.status_code, detail)
+        await update.message.reply_text(f"⚠️ Ошибка (HTTP {e.response.status_code}): {detail}")
+    except Exception as e:
+        logger.exception("Video QA error")
+        await update.message.reply_text(f"⚠️ Не получилось разобрать видео: {e}")
+
+
 async def ask_voice(chat_id: int, user_id: int, user_text: str) -> str:
     """Context-aware, in-character reply for /say (uses + updates history)."""
     key = (chat_id, user_id)
@@ -1678,13 +1749,21 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id, user_id = _ids(update)
     msg = update.message
     reply = msg.reply_to_message
+    # A replied video → analyse frames.
+    if reply and (reply.video or reply.video_note or
+                  (reply.document and (reply.document.mime_type or "").startswith("video/"))):
+        vid = reply.video or reply.video_note or reply.document
+        q = " ".join(context.args).strip() or "Что происходит на видео? Опиши по кадрам."
+        await answer_about_video(update, context, chat_id, user_id, vid.file_id, q)
+        return
+
     file_id = mime = None
     if reply and reply.photo:
         file_id, mime = reply.photo[-1].file_id, "image/jpeg"
     elif reply and reply.document and (reply.document.mime_type or "").startswith("image/"):
         file_id, mime = reply.document.file_id, reply.document.mime_type
     if not file_id:
-        await msg.reply_text("Ответь командой /ask <вопрос> на сообщение с фото 🖼")
+        await msg.reply_text("Ответь командой /ask <вопрос> на сообщение с фото или видео 🖼")
         return
     question = " ".join(context.args).strip() or "Что на этом изображении? Опиши и выдели важное."
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -1991,6 +2070,24 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await msg.reply_text(f"⚠️ Не получилось обработать фото: {e}")
 
 
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A video with a question caption → sample frames and answer about it."""
+    chat_id, user_id = _ids(update)
+    _touch(chat_id)
+    msg = update.message
+    media = msg.video or msg.video_note
+    if media is None and msg.document and (msg.document.mime_type or "").startswith("video/"):
+        media = msg.document
+    if media is None:
+        return
+    # In groups, only react when the bot is addressed.
+    if _is_group(update) and not _addressed_to_bot(update, context):
+        return
+    question = _strip_bot_mention((msg.caption or "").strip(), context) \
+        or "Что происходит на видео? Опиши по кадрам."
+    await answer_about_video(update, context, chat_id, user_id, media.file_id, question)
+
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Transcribe a voice note / audio, then answer it like a normal message."""
     chat_id, user_id = _ids(update)
@@ -2039,7 +2136,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🎙 Голосовое — распознаю и отвечу.\n"
         "🖼 Фото без запроса — переделаю во всратую смешную версию 😈\n"
         "✏️ Фото с подписью-инструкцией — отредактирую; с вопросом («что тут?») — отвечу 👁\n"
-        "❓ /ask (reply на фото) — разберу и отвечу по картинке\n"
+        "❓ /ask (reply на фото/видео) — разберу и отвечу по кадрам\n"
+        "🎞 Видео с подписью-вопросом — проанализирую по кадрам\n"
         "📄 PDF или текстовый файл — отвечу по содержимому.\n"
         "🔄 Под картинками есть кнопка «Ещё вариант».\n\n"
         "Команды:\n"
@@ -2718,6 +2816,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(callback_automem, pattern=r"^automem:"))
     app.add_handler(CallbackQueryHandler(callback_regen, pattern=r"^regen$"))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
+    app.add_handler(MessageHandler(
+        filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO, handle_video))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
