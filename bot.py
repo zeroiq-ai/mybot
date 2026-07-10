@@ -1773,25 +1773,33 @@ async def cmd_videoit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     extra = " ".join(context.args).strip()
     src_text = (reply.text or reply.caption or "").strip()
-    reply_photo = reply.photo[-1] if reply.photo else None
-    if not src_text and not reply_photo:
+
+    # Grab an image from the replied message — photo OR image sent as a file.
+    img_file_id = img_mime = None
+    if reply.photo:
+        img_file_id, img_mime = reply.photo[-1].file_id, "image/jpeg"
+    elif reply.document and (reply.document.mime_type or "").startswith("image/"):
+        img_file_id, img_mime = reply.document.file_id, reply.document.mime_type
+
+    text = " ".join(x for x in [src_text, extra] if x).strip()
+    if not img_file_id and not text:
         await msg.reply_text("В том сообщении нет текста или фото для видео.")
         return
 
     frame = None
-    if reply_photo and get_video_model(chat_id) != "openai/sora-2-pro":
-        raw = await download_tg_file(context, reply_photo.file_id)
-        frame = _data_url(raw, "image/jpeg")
+    if img_file_id:
+        if get_video_model(chat_id) == "openai/sora-2-pro":
+            await msg.reply_text(
+                "Sora не умеет видео по фото. Выбери другую модель в /vidmodel "
+                "(например Wan 2.6 или Veo), либо сделай /video по тексту.")
+            return
+        raw = await download_tg_file(context, img_file_id)
+        frame = _data_url(raw, img_mime)
 
-    # Use the source text (nearly) verbatim — don't re-invent a prompt.
-    text = " ".join(x for x in [src_text, extra] if x).strip()
     if frame:
         # Photo becomes the first frame → the model continues from it.
         prompt = text or "Продолжи этот кадр: естественное плавное движение, сохрани стиль и композицию."
     else:
-        if not text:
-            await msg.reply_text("В том сообщении нет текста для видео.")
-            return
         prompt = text
     await _run_video(update, context, chat_id, prompt, frame_image=frame)
 
