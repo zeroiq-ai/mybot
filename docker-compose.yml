@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    command: python bot.py
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - DB_PATH=/data/bot.db
+    volumes:
+      - ./data:/data      # persists the SQLite DB across restarts

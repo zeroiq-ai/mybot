@@ -1,0 +1,14 @@
+.git
+.github
+tests
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+.env
+data/
+nixpacks.toml
+Procfile
+runtime.txt
+telegram-claude-bot.zip
