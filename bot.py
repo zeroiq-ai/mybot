@@ -1986,7 +1986,58 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     # Is there an explicit instruction for the bot?
     caption = (msg.caption or "").strip()
-    if _is_group(update):
+
+    # Telegram does NOT trigger CommandHandler on photo captions, so a caption like
+    # "/videoit ..." would otherwise be treated as an edit prompt. Route it here.
+    cmd, arg = "", caption
+    if caption.startswith("/"):
+        head = caption.split(maxsplit=1)
+        token = head[0]
+        arg = head[1].strip() if len(head) > 1 else ""
+        cmd = token.lower()
+        target = ""
+        if "@" in cmd:
+            cmd, target = cmd.split("@", 1)
+        bot_un = (context.bot.username or "").lower()
+        if target and bot_un and target != bot_un:
+            cmd = ""   # command aimed at another bot — ignore routing
+
+    if cmd == "/videoit":
+        if get_video_model(chat_id) == "openai/sora-2-pro":
+            await msg.reply_text("Sora не умеет видео по фото — выбери другую модель в /vidmodel.")
+            return
+        raw = await download_tg_file(context, file_id)
+        await _run_video(
+            update, context, chat_id,
+            arg or "Продолжи этот кадр: естественное плавное движение, сохрани стиль и композицию.",
+            frame_image=_data_url(raw, mime))
+        return
+
+    if cmd == "/ask":
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        try:
+            raw = await download_tg_file(context, file_id)
+            question = arg or "Что на этом изображении? Опиши и выдели важное."
+            answer = await gen_vision(
+                build_system(user_id, chat_id),
+                [{"type": "text", "text": question},
+                 {"type": "image_url", "image_url": {"url": _data_url(raw, mime)}}], chat_id)
+            key = (chat_id, user_id)
+            conversations[key].append({"role": "user", "content": f"[изображение] {question}"})
+            conversations[key].append({"role": "assistant", "content": answer})
+            trim_history(key)
+            save_message(chat_id, user_id, "user", f"[изображение] {question}")
+            save_message(chat_id, user_id, "assistant", answer)
+            await send_md(msg, answer or "⚠️ Не удалось разобрать изображение.")
+        except Exception as e:
+            logger.exception("Ask(caption) error")
+            await msg.reply_text(f"⚠️ Не получилось разобрать фото: {e}")
+        return
+
+    # /imagine, /imagineit, /edit in a caption → explicit image edit from this photo.
+    if cmd in ("/imagineit", "/imagine", "/edit", "/img"):
+        prompt = _strip_bot_mention(arg, context) or "Reimagine this image creatively, keep the subject."
+    elif _is_group(update):
         # In groups, an instruction only counts if the bot is addressed.
         prompt = _strip_bot_mention(caption, context) if _addressed_to_bot(update, context) else ""
     else:
